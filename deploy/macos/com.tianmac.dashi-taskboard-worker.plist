@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tianmac.dashi-taskboard-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/tianmac/Documents/技能管理及日常管理/dashi-taskboard/scripts/task-worker.mjs</string>
+    <string>--config</string>
+    <string>/Users/tianmac/Applications/dashi-taskboard/.data/worker.json</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/tianmac/Library/Logs/dashi-taskboard/worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/tianmac/Library/Logs/dashi-taskboard/worker-error.log</string>
+</dict>
+</plist>

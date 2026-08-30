@@ -80,7 +80,14 @@ function redirect(response, location, cookie) {
 }
 
 function sendError(response, status, message) {
-  const body = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>企业微信登录失败</title><body><main><h2>无法打开任务看板</h2><p>${message}</p></main></body></html>`;
+  // message 可能携带上游企业微信返回的 userId 等外部字符串，必须转义防注入。
+  const safeMessage = String(message)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+  const body = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>企业微信登录失败</title><body><main><h2>无法打开任务看板</h2><p>${safeMessage}</p></main></body></html>`;
   response.writeHead(status, {
     "cache-control": "no-store",
     "content-length": Buffer.byteLength(body),
@@ -153,6 +160,14 @@ export function resolveWeComConfig(overrides = {}) {
     serviceSecret: String(
       overrides.serviceSecret ?? environment.CODEX_TASKBOARD_SERVICE_SECRET ?? "",
     ),
+    // 专用密钥域：代发用户身份（cloud-companion）与 bridge 冒名绝不能复用
+    // 所有 Agent 共享的 serviceSecret，否则任一 Agent 可伪造人类管理员。
+    companionSecret: String(
+      overrides.companionSecret ?? environment.CODEX_TASKBOARD_COMPANION_SECRET ?? "",
+    ),
+    bridgeSecret: String(
+      overrides.bridgeSecret ?? environment.CODEX_TASKBOARD_BRIDGE_SECRET ?? "",
+    ),
     publicUrl: publicUrl.replace(/\/$/, ""),
     publicOrigin,
     proxyUrl: String(
@@ -205,11 +220,28 @@ export function createWeComAuth({ database, config, fetch: fetchImplementation =
       return null;
     }
     const separator = decoded.indexOf(":");
-    if (separator < 1 || !equalSecret(decoded.slice(separator + 1), config.serviceSecret)) return null;
+    if (separator < 1) return null;
+    const secret = decoded.slice(separator + 1);
+    const matchesService = equalSecret(secret, config.serviceSecret);
+    // 特权密钥域：companion 代发与 bridge 冒名各自校验专用密钥。
+    const matchesCompanion = Boolean(config.companionSecret) && equalSecret(secret, config.companionSecret);
+    const matchesBridge = Boolean(config.bridgeSecret) && equalSecret(secret, config.bridgeSecret);
+    if (!matchesService && !matchesCompanion && !matchesBridge) return null;
     const username = decoded.slice(0, separator).trim();
     if (!username || username.length > 120) return null;
     const userId = `basic:${encodeURIComponent(username.toLowerCase())}`;
     if (request.headers["x-taskboard-client"] === "cloud-companion") {
+      // acting-user 身份转发只信任专用 companion 密钥；共享 serviceSecret 的
+      // 普通 Agent 即使带上这些头也只会得到普通 agent 身份，无法成为管理员。
+      if (!matchesCompanion) {
+        return {
+          type: "agent",
+          id: `${userId}:cloud-companion`,
+          username,
+          name: `Agent (${username})`,
+          avatarUrl: null,
+        };
+      }
       const actingId = String(request.headers["x-taskboard-acting-user-id"] ?? "").trim();
       let actingName;
       try {
@@ -228,8 +260,19 @@ export function createWeComAuth({ database, config, fetch: fetchImplementation =
         avatarUrl: actingAvatar || null,
       };
     }
-    const clientTag = request.headers["x-taskboard-client"];
+    let clientTag = request.headers["x-taskboard-client"];
     if (typeof clientTag === "string" && clientTag.length > 0 && clientTag.length <= 64) {
+      // bridge 冒名身份仅授予专用 bridge 密钥；未配置 bridgeSecret 时按旧部署
+      // 回退为「用户名必须精确为 workbuddy-agent」，绝不接受任意用户名。
+      const bridgeAuthorized = matchesBridge
+        || (!config.bridgeSecret && matchesService && username === "workbuddy-agent");
+      if (clientTag === "workbuddy-bridge" && !bridgeAuthorized) {
+        clientTag = null;
+      }
+    } else {
+      clientTag = null;
+    }
+    if (clientTag) {
       return {
         type: "agent",
         id: `${userId}:${clientTag}`,

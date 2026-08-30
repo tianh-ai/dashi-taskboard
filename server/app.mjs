@@ -196,6 +196,15 @@ function assertTrustedNetworkRequest(request, trustedOrigin = null) {
   }
 }
 
+function requestHasProxyHeaders(request) {
+  // 同机反向代理（nginx）会把公网流量的 remoteAddress 变成 127.0.0.1，
+  // 但一定带上代理头；真正的本机直连请求不会带。与 actorFromLocalTaskctl
+  // 的防伪造检查保持一致，防止公网流量冒充本机来源。
+  return request.headers["x-forwarded-for"] !== undefined
+    || request.headers["x-real-ip"] !== undefined
+    || request.headers.forwarded !== undefined;
+}
+
 function assertLoopbackRequest(request) {
   const address = request.socket.remoteAddress;
   if (
@@ -203,6 +212,9 @@ function assertLoopbackRequest(request) {
     && address !== "::1"
     && address !== "::ffff:127.0.0.1"
   ) {
+    throw new ApiError(403, "LOCAL_ONLY", "This endpoint is only available on this device");
+  }
+  if (requestHasProxyHeaders(request)) {
     throw new ApiError(403, "LOCAL_ONLY", "This endpoint is only available on this device");
   }
 }
@@ -259,7 +271,7 @@ function isLoopbackAddress(value) {
 }
 
 function assertAiLoopbackRequest(request) {
-  if (!isLoopbackAddress(request.socket.remoteAddress)) {
+  if (!isLoopbackAddress(request.socket.remoteAddress) || requestHasProxyHeaders(request)) {
     throw new ApiError(403, "LOCAL_AI_LOOPBACK_REQUIRED", "Local AI routes are only available from this device");
   }
 }
@@ -1529,6 +1541,10 @@ export function resolveServerOptions(options = {}) {
       ?? path.join(codexHome, ".codex-global-state.json"),
     codexProcessesPath: options.codexProcessesPath
       ?? path.join(codexHome, "process_manager", "chat_processes.json"),
+    // 权威云实例应设为 "true"：机器能力路由（在任意 workspacePath 执行
+    // git/codex 扫描）只允许本机直连，公网经 nginx 的流量会被拒绝。
+    machineCapabilitiesLoopbackOnly: options.machineCapabilitiesLoopbackOnly
+      ?? ["1", "true", "yes"].includes(String(process.env.CODEX_TASKBOARD_MACHINE_CAPABILITIES_LOOPBACK ?? "").trim().toLowerCase()),
   };
 }
 
@@ -1611,7 +1627,9 @@ export function createTaskboardServer(options = {}) {
       const capabilityCloudConfig = isMachineCapabilityRoute
         ? await cloudConfig.read()
         : null;
-      if (capabilityCloudConfig?.remoteUrl) assertLoopbackRequest(request);
+      if (capabilityCloudConfig?.remoteUrl || (resolved.machineCapabilitiesLoopbackOnly && pathname !== "/api/meta")) {
+        assertLoopbackRequest(request);
+      }
 
       if (pathname === "/health") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
@@ -1995,7 +2013,10 @@ export function createTaskboardServer(options = {}) {
               const changes = {};
               if (title !== current.title) changes.title = title;
               if (description !== null && description !== current.description) changes.description = description;
-              if (status !== undefined && status !== current.status) changes.status = status;
+              // 已审批完成的任务不允许被同步通道打回 todo/in_progress；
+              // done 只能退到 in_review（重开审批），重开决策属于人类管理员。
+              const reopenedForReview = current.status === "done" && (status === "todo" || status === "in_progress");
+              if (status !== undefined && status !== current.status && !reopenedForReview) changes.status = status;
               if (Object.keys(changes).length > 0) {
                 task = database.updateTask(existingId, current.version, changes, undefined);
                 events.emit("task.updated", { task });
@@ -2031,7 +2052,9 @@ export function createTaskboardServer(options = {}) {
             if (!explicitId && !username) {
               throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Agent tools require agent (Basic + x-taskboard-client) authentication");
             }
-            if (explicitId && username && username !== "workbuddy-agent" && explicitId !== username) {
+            if (explicitId && username && explicitId !== username) {
+              // 不存在任何用户名例外：否则任一持密钥者都可用 workbuddy-agent
+              // 覆写其他 Agent 的注册信息，伪造其「名称·设备」群聊身份。
               throw new ApiError(403, "AGENT_ID_MISMATCH", `Authenticated as '${username}'; cannot register as '${explicitId}'`);
             }
             const capabilities = Array.isArray(args.capabilities)

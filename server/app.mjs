@@ -1627,7 +1627,12 @@ export function createTaskboardServer(options = {}) {
       const capabilityCloudConfig = isMachineCapabilityRoute
         ? await cloudConfig.read()
         : null;
-      if (capabilityCloudConfig?.remoteUrl || (resolved.machineCapabilitiesLoopbackOnly && pathname !== "/api/meta")) {
+      if (
+        capabilityCloudConfig?.remoteUrl
+        || (isMachineCapabilityRoute
+          && pathname !== "/api/meta"
+          && resolved.machineCapabilitiesLoopbackOnly)
+      ) {
         assertLoopbackRequest(request);
       }
 

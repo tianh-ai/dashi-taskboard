@@ -636,6 +636,17 @@ function assertProjectAccess(request, database, projectId) {
   }
 }
 
+// 每个 Agent 只能读取/领取其注册 projects 范围内的任务；
+// projects 为空表示服务所有项目（常驻 Worker 默认）。
+// 与 dashi_agent_events 的事件过滤保持同一语义。
+function assertAgentProjectScope(database, username, projectId) {
+  if (!username || username === "workbuddy-agent") return;
+  const agent = database.getAgent(username);
+  if (agent?.projects?.length > 0 && !agent.projects.includes(projectId)) {
+    throw new ApiError(403, "PROJECT_ACCESS_DENIED", "此任务不在该 Agent 的授权项目范围内");
+  }
+}
+
 function parseProjectMember(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["userId", "userName", "userAvatarUrl", "role"]));
@@ -1940,6 +1951,7 @@ export function createTaskboardServer(options = {}) {
             const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
             const task = database.getTask(taskId);
             if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+            assertAgentProjectScope(database, agentUsernameFromActor(actorFromRequest(request)), task.projectId);
             result = { task };
           } else if (toolName === "dashi_add_comment") {
             const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
@@ -2174,6 +2186,9 @@ export function createTaskboardServer(options = {}) {
             if (!username) throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Agent tools require agent authentication");
             const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
             const leaseSeconds = boundedLeaseSeconds(args.leaseSeconds);
+            const claimTarget = database.getTask(taskId);
+            if (!claimTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+            assertAgentProjectScope(database, username, claimTarget.projectId);
             const claim = database.claimTask(taskId, username, leaseSeconds);
             const agent = database.getAgent(username);
             const agentLabel = agent.device ? `${agent.name}·${agent.device}` : agent.name;

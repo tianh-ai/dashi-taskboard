@@ -2132,6 +2132,11 @@ export function createTaskboardServer(options = {}) {
             }
             const username = agentUsernameFromActor(actorFromRequest(request));
             const registeredAgent = username ? database.getAgent(username) : null;
+            // 未注册 agent 不得静默返回空列表并推进游标：那会永久吞掉派发。
+            // 明确 404 让 worker 触发重注册自愈。
+            if (username && username !== "workbuddy-agent" && !registeredAgent) {
+              throw new ApiError(404, "AGENT_NOT_FOUND", `Agent '${username}' is not registered; call dashi_agent_register first`);
+            }
             const allEvents = database.listIntegrationEvents("agents", after, limit);
             const eventsForAgent = username && username !== "workbuddy-agent"
               ? allEvents.filter((event) => (
@@ -2152,7 +2157,11 @@ export function createTaskboardServer(options = {}) {
               : allEvents;
             result = {
               events: eventsForAgent,
-              nextCursor: allEvents.at(-1)?.sequence ?? after,
+              // 无新事件时返回服务端最大 sequence（而非回显 after）：
+              // 客户端据此检测事件库重建（nextCursor < 本地游标 → 归零重放）。
+              nextCursor: allEvents.at(-1)?.sequence
+                ?? database.maxIntegrationSequence("agents")
+                ?? 0,
             };
           } else if (toolName === "dashi_claim_task") {
             const username = agentUsernameFromActor(actorFromRequest(request));

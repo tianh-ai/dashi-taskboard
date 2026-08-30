@@ -235,3 +235,94 @@ test("the mcp client surfaces tool errors with their server-side codes", async (
     (error) => error.code === "AGENT_NOT_FOUND",
   );
 });
+
+test("a poison dispatch (task deleted) is skipped and never blocks later dispatches", async () => {
+  const { baseUrl, directory } = await startServer();
+  const { worker } = makeWorker(baseUrl, "worker-poison");
+  await worker.register();
+
+  // 直接注入一条指向不存在任务的毒派发（正常流程不会产生，模拟派发后任务被删）。
+  const database = new DatabaseSync(path.join(directory, "taskboard.sqlite"));
+  database.prepare(`
+    INSERT INTO integration_outbox (destination, event_type, project_id, task_id, payload, created_at)
+    VALUES ('agents', 'agent.dispatch', NULL, 'ghost-task', ?, '2026-08-30T00:00:00.000Z')
+  `).run(JSON.stringify({
+    type: "agent.dispatch",
+    projectId: "worker-poison-proj",
+    taskId: "ghost-task",
+    body: "毒事件",
+    anyAgent: true,
+    targets: [],
+  }));
+  database.close();
+
+  await rest(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "worker-poison-proj", name: "毒事件恢复" },
+  });
+  await rest(baseUrl, "/api/projects/worker-poison-proj/messages", {
+    method: "POST",
+    body: { body: "@Agent 毒事件之后的正常派发", mentions: ["agent"] },
+  });
+
+  const state = { cursor: 0 };
+  const outcomes = await worker.pollOnce(state);
+  assert.equal(outcomes.length, 2, JSON.stringify(outcomes));
+  assert.equal(outcomes[0].status, "skipped");
+  assert.equal(outcomes[0].reason, "TASK_NOT_FOUND");
+  assert.equal(outcomes[1].status, "done", "毒事件之后的有效派发必须被处理");
+  // 游标必须越过毒事件：再轮询不得重复处理任何事件。
+  const again = await worker.pollOnce(state);
+  assert.equal(again.length, 0);
+});
+
+test("dashi_agent_events rejects unregistered agents instead of silently eating events", async () => {
+  const { baseUrl } = await startServer();
+  await rest(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "ghost-events", name: "幽灵事件" },
+  });
+  await rest(baseUrl, "/api/projects/ghost-events/messages", {
+    method: "POST",
+    body: { body: "@Agent 未注册视角测试", mentions: ["agent"] },
+  });
+  const { worker } = makeWorker(baseUrl, "worker-registered");
+  await worker.register();
+  const ghost = createMcpClient({
+    baseUrl,
+    username: "worker-ghost2",
+    secret: SERVICE_SECRET,
+    clientTag: "task-worker",
+  });
+  // 未注册 agent 必须显式 404（触发 worker 重注册自愈），而不是空列表 + 游标前进。
+  await assert.rejects(
+    ghost.call("dashi_agent_events", { after: 0 }),
+    (error) => error.code === "AGENT_NOT_FOUND",
+  );
+  const seen = await worker.mcp.call("dashi_agent_events", { after: 0 });
+  assert.ok(seen.events.some((event) => event.eventType === "agent.dispatch"));
+});
+
+test("a server event-log reset (cursor moving backwards) triggers replay from zero", async () => {
+  const { baseUrl } = await startServer();
+  const { worker, logs } = makeWorker(baseUrl, "worker-reset");
+  await worker.register();
+
+  await rest(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "worker-reset", name: "游标回退" },
+  });
+  await rest(baseUrl, "/api/projects/worker-reset/messages", {
+    method: "POST",
+    body: { body: "@Agent 游标回退重放测试", mentions: ["agent"] },
+  });
+
+  // 模拟服务端重建后 worker 本地游标远超服务端最新 sequence。
+  const state = { cursor: 999_999 };
+  const outcomes = await worker.pollOnce(state);
+  assert.equal(outcomes.length, 1, JSON.stringify(outcomes));
+  assert.equal(outcomes[0].status, "done", "游标回退必须归零重放并处理派发");
+  assert.ok(logs.some((message) => message.includes("moved backwards")));
+  assert.ok(state.cursor > 0 && state.cursor < 999_999, "游标必须回到服务端实际范围");
+});
+

@@ -1381,6 +1381,13 @@ export class TaskboardDatabase {
     return Number(result.lastInsertRowid);
   }
 
+  maxIntegrationSequence(destination) {
+    const row = this.database.prepare(
+      "SELECT MAX(sequence) AS max FROM integration_outbox WHERE destination = ?",
+    ).get(destination);
+    return row?.max ?? null;
+  }
+
   listIntegrationEvents(destination, after = 0, limit = 100) {
     return this.database.prepare(`
       SELECT sequence, event_type, project_id, task_id, payload, created_at
@@ -1580,38 +1587,47 @@ export class TaskboardDatabase {
     if (agent.activeLeases.length >= agent.concurrency) {
       throw new ApiError(409, "AGENT_AT_CAPACITY", `Agent '${agentId}' reached its concurrency limit`);
     }
-    const result = this.database.prepare(`
-      UPDATE tasks SET
-        status = 'in_progress',
-        assignee_type = 'agent',
-        assignee_id = ?,
-        assignee_name = ?,
-        assignee_avatar_url = NULL,
-        version = version + 1,
-        updated_at = ?
-      WHERE id = ?
-        AND archived_at IS NULL
-        AND status IN ('todo', 'backlog', 'blocked', 'in_progress')
-        AND NOT EXISTS (
-          SELECT 1 FROM task_leases l
-          WHERE l.task_id = tasks.id AND l.agent_id != ? AND l.expires_at > ?
-        )
-    `).run(agentId, `${agent.name}·${agent.device || agent.id}`, timestamp, taskId, agentId, timestamp);
-    if (result.changes === 0) {
-      const activeLease = previousLease && previousLease.expiresAt > timestamp ? previousLease : null;
-      if (activeLease && activeLease.agentId !== agentId) {
-        throw new ApiError(409, "LEASE_HELD", `Task is leased by agent '${activeLease.agentId}' until ${activeLease.expiresAt}`);
+    // 领取是两段写（任务置 in_progress + 写租约），必须同一事务：
+    // 否则崩溃窗口留下无租约的 in_progress 任务，多进程下可双领取。
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.database.prepare(`
+        UPDATE tasks SET
+          status = 'in_progress',
+          assignee_type = 'agent',
+          assignee_id = ?,
+          assignee_name = ?,
+          assignee_avatar_url = NULL,
+          version = version + 1,
+          updated_at = ?
+        WHERE id = ?
+          AND archived_at IS NULL
+          AND status IN ('todo', 'backlog', 'blocked', 'in_progress')
+          AND NOT EXISTS (
+            SELECT 1 FROM task_leases l
+            WHERE l.task_id = tasks.id AND l.agent_id != ? AND l.expires_at > ?
+          )
+      `).run(agentId, `${agent.name}·${agent.device || agent.id}`, timestamp, taskId, agentId, timestamp);
+      if (result.changes === 0) {
+        const activeLease = previousLease && previousLease.expiresAt > timestamp ? previousLease : null;
+        if (activeLease && activeLease.agentId !== agentId) {
+          throw new ApiError(409, "LEASE_HELD", `Task is leased by agent '${activeLease.agentId}' until ${activeLease.expiresAt}`);
+        }
+        throw new ApiError(409, "TASK_NOT_CLAIMABLE", `Task status '${task.status}' cannot be claimed`);
       }
-      throw new ApiError(409, "TASK_NOT_CLAIMABLE", `Task status '${task.status}' cannot be claimed`);
+      this.database.prepare(`
+        INSERT INTO task_leases (task_id, agent_id, claimed_at, renewed_at, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (task_id) DO UPDATE SET
+          agent_id = excluded.agent_id,
+          renewed_at = excluded.renewed_at,
+          expires_at = excluded.expires_at
+      `).run(taskId, agentId, timestamp, timestamp, expiresAt);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
     }
-    this.database.prepare(`
-      INSERT INTO task_leases (task_id, agent_id, claimed_at, renewed_at, expires_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT (task_id) DO UPDATE SET
-        agent_id = excluded.agent_id,
-        renewed_at = excluded.renewed_at,
-        expires_at = excluded.expires_at
-    `).run(taskId, agentId, timestamp, timestamp, expiresAt);
     return {
       task: this.getTask(taskId),
       lease: this.getTaskLease(taskId),

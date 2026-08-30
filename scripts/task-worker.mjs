@@ -5,7 +5,7 @@
 // 用法：node scripts/task-worker.mjs --config ~/.Applications/dashi-taskboard/.data/worker.json
 //       或全部通过 DASHI_WORKER_* 环境变量提供。
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, rename } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -18,6 +18,15 @@ export const WORKER_DEFAULTS = {
   eventLimit: 50,
   execTimeoutMs: 600_000,
 };
+
+// 派发处理中不可恢复的服务端错误码：跳过该事件并推进游标（毒事件不得卡死轮询）。
+// AGENT_NOT_FOUND 不在此列：那是服务端 agent 记录丢失，重注册即可自愈，必须重试而非丢弃。
+// 其余错误（网络、租约容量等）同样视为可恢复：游标停在该事件之前，下一轮只重试它。
+const UNRECOVERABLE_EVENT_ERRORS = new Set([
+  "TASK_NOT_FOUND",
+  "PROJECT_NOT_FOUND",
+  "INVALID_FIELD",
+]);
 
 export class WorkerError extends Error {
   constructor(message, code = "WORKER_ERROR") {
@@ -246,6 +255,9 @@ export function createTaskWorker(config, deps = {}) {
     const task = claim.task;
     log(`claimed ${task.id}「${task.title}」 (tookOver=${claim.tookOver}) lease→${claim.lease.expiresAt}`);
 
+    // 租约丢失感知：LEASE_NOT_HELD 意味着租约已被接管/清理，
+    // 继续回写只会与接管者产生矛盾记录，必须中止后续动作。
+    let leaseLost = false;
     const renewTimer = setInterval(() => {
       mcp.call("dashi_renew_task_lease", {
         taskId: task.id,
@@ -253,12 +265,20 @@ export function createTaskWorker(config, deps = {}) {
       }).then((result) => {
         log(`renewed lease on ${task.id} → ${result.lease.expiresAt}`);
       }).catch((error) => {
-        log(`lease renewal failed on ${task.id}: ${error.message}`);
+        if (error.code === "LEASE_NOT_HELD") {
+          leaseLost = true;
+          log(`lease on ${task.id} lost (taken over); will skip writeback`);
+        } else {
+          log(`lease renewal failed on ${task.id}: ${error.message}`);
+        }
       });
     }, Math.max(10_000, (config.leaseSeconds * 1000) / 3));
 
     try {
       const execution = await executeTask(dispatch, task);
+      if (leaseLost) {
+        return { status: "aborted", reason: "LEASE_LOST", execution };
+      }
       const comment = await mcp.call("dashi_add_comment", { taskId: task.id, body: execution.summary });
       await mcp.call("dashi_post_project_message", {
         projectId: dispatch.projectId,
@@ -266,10 +286,18 @@ export function createTaskWorker(config, deps = {}) {
         kind: "progress",
         taskId: task.id,
       });
-      const submitted = await mcp.call("dashi_submit_for_review", {
-        taskId: task.id,
-        version: comment.task?.version ?? task.version,
-      });
+      // 提审前取最新 version 重试一次：执行期间管理员的编辑不应使成果作废。
+      const submitWithLatestVersion = async () => {
+        const latest = await mcp.call("dashi_get_task", { taskId: task.id });
+        return mcp.call("dashi_submit_for_review", { taskId: task.id, version: latest.task.version });
+      };
+      let submitted;
+      try {
+        submitted = await submitWithLatestVersion();
+      } catch (error) {
+        if (error.code !== "VERSION_CONFLICT") throw error;
+        submitted = await submitWithLatestVersion();
+      }
       log(`submitted ${task.id} for review (status=${submitted.task.status})`);
       return { status: "done", task: submitted.task, execution };
     } catch (error) {
@@ -286,35 +314,82 @@ export function createTaskWorker(config, deps = {}) {
   }
 
   async function pollOnce(state) {
-    const result = await mcp.call("dashi_agent_events", {
-      after: state.cursor,
+    let after = state.cursor;
+    let result = await mcp.call("dashi_agent_events", {
+      after,
       limit: Math.min(200, Math.max(1, Math.round(config.eventLimit))),
     });
-    const outcomes = [];
-    for (const event of result.events) {
-      if (event.eventType === "agent.dispatch") {
-        log(`dispatch event #${event.sequence} for task ${event.payload.taskId} (${event.payload.anyAgent ? "@Agent" : "定向"})`);
-        outcomes.push(await handleDispatch(event.payload));
-        continue;
+    // 服务端事件库重建后 sequence 从更小值重新开始：检测游标回退，
+    // 归零重放并重注册（重放幂等：已处理任务会 TASK_NOT_CLAIMABLE 跳过）。
+    if (result.nextCursor < state.cursor) {
+      log(`event cursor moved backwards (${state.cursor} → ${result.nextCursor}); server event log reset; replaying from 0`);
+      state.cursor = 0;
+      await deps.persistState?.(state);
+      try {
+        await register();
+      } catch (error) {
+        log(`re-register after cursor reset failed: ${error.message}`);
       }
-      if (event.eventType === "agent.review" && event.payload.agentId === config.username) {
-        if (event.payload.decision === "changes_requested") {
-          // 管理员驳回：作为新派发重新领取执行（每轮重做都由人类审批触发，不会失控循环）。
-          log(`review event #${event.sequence}: task ${event.payload.taskId} returned; re-running`);
-          outcomes.push(await handleDispatch({
-            taskId: event.payload.taskId,
-            projectId: event.payload.projectId,
-            messageId: null,
-            body: `审批驳回：${event.payload.note ?? "（无备注）"}。请按批注修改后重新提审。`,
-            anyAgent: false,
-            targets: [],
-          }));
+      result = await mcp.call("dashi_agent_events", {
+        after: 0,
+        limit: Math.min(200, Math.max(1, Math.round(config.eventLimit))),
+      });
+    }
+    const outcomes = [];
+    let blocked = false;
+    for (const event of result.events) {
+      let outcome = null;
+      try {
+        if (event.eventType === "agent.dispatch") {
+          log(`dispatch event #${event.sequence} for task ${event.payload.taskId} (${event.payload.anyAgent ? "@Agent" : "定向"})`);
+          outcome = await handleDispatch(event.payload);
+        } else if (event.eventType === "agent.review" && event.payload.agentId === config.username) {
+          if (event.payload.decision === "changes_requested") {
+            // 管理员驳回：作为新派发重新领取执行（每轮重做都由人类审批触发，不会失控循环）。
+            log(`review event #${event.sequence}: task ${event.payload.taskId} returned; re-running`);
+            outcome = await handleDispatch({
+              taskId: event.payload.taskId,
+              projectId: event.payload.projectId,
+              messageId: null,
+              body: `审批驳回：${event.payload.note ?? "（无备注）"}。请按批注修改后重新提审。`,
+              anyAgent: false,
+              targets: [],
+            });
+          } else {
+            log(`review event #${event.sequence}: task ${event.payload.taskId} approved`);
+          }
+        }
+      } catch (error) {
+        if (error.code === "AGENT_NOT_FOUND") {
+          // 服务端 agent 记录丢失：重注册后下一轮重试本事件（游标停在事件前，派发不丢）。
+          log(`agent record missing on server; re-registering`);
+          try {
+            await register();
+          } catch (registerError) {
+            log(`re-register failed: ${registerError.message}`);
+          }
+          blocked = true;
+          break;
+        }
+        if (UNRECOVERABLE_EVENT_ERRORS.has(error.code)) {
+          // 毒事件：跳过并推进游标，绝不卡死后续派发。
+          log(`event #${event.sequence} unrecoverable (${error.code}); skipping`);
+          outcome = { status: "skipped", reason: error.code };
         } else {
-          log(`review event #${event.sequence}: task ${event.payload.taskId} approved`);
+          // 可恢复错误（网络/租约容量等）：游标停在本事件之前，下一轮只重试它。
+          log(`event #${event.sequence} failed (${error.code ?? error.message}); will retry next poll`);
+          blocked = true;
+          break;
         }
       }
+      if (outcome) outcomes.push(outcome);
+      // 逐事件推进游标：已处理的事件绝不被重放（避免重复执行外部命令）。
+      if (event.sequence > state.cursor) {
+        state.cursor = event.sequence;
+        await deps.persistState?.(state);
+      }
     }
-    if (result.nextCursor > state.cursor) {
+    if (!blocked && result.nextCursor > state.cursor) {
       state.cursor = result.nextCursor;
       await deps.persistState?.(state);
     }
@@ -340,18 +415,30 @@ export async function runWorker(config, { signal, worker } = {}) {
   const state = await loadState(config.statePath);
   const persistState = config.statePath
     ? async (next) => {
-      await writeFile(config.statePath, `${JSON.stringify(next)}\n`, { mode: 0o600 });
+      // 原子写：断电/崩溃时的半写状态文件会把游标悄悄归零，必须 temp+rename。
+      const tempPath = `${config.statePath}.tmp`;
+      await writeFile(tempPath, `${JSON.stringify(next)}\n`, { mode: 0o600 });
+      await rename(tempPath, config.statePath);
     }
     : undefined;
-  const bound = {
-    ...instance,
-    pollOnce: (current) => instance.pollOnce(current),
-  };
   if (persistState) await persistState(state);
 
+  const ensureRegistered = async (error) => {
+    // 服务端 agent 记录丢失（DB 重建/清理）自愈：重新注册，事件轮询下轮恢复。
+    if (error?.code !== "AGENT_NOT_FOUND") return;
+    instance.log("agent record missing on server; re-registering");
+    try {
+      await instance.register();
+    } catch (registerError) {
+      instance.log(`re-register failed: ${registerError.message}`);
+    }
+  };
   await instance.register();
   const heartbeatTimer = setInterval(() => {
-    instance.heartbeat().catch((error) => instance.log(`heartbeat failed: ${error.message}`));
+    instance.heartbeat().catch(async (error) => {
+      instance.log(`heartbeat failed: ${error.message}`);
+      await ensureRegistered(error);
+    });
   }, config.heartbeatIntervalMs);
   heartbeatTimer.unref?.();
 
@@ -370,6 +457,7 @@ export async function runWorker(config, { signal, worker } = {}) {
         if (persistState) await persistState(state);
       } catch (error) {
         instance.log(`poll failed: ${error.message}`);
+        await ensureRegistered(error);
       }
       if (stopped) break;
       await new Promise((resolve) => {

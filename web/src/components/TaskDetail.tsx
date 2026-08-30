@@ -26,6 +26,7 @@ import type {
   TaskDraft,
   TaskPriority,
   TaskRelationSummary,
+  SessionRole,
   TaskStatus,
   WorkflowOption,
 } from "../types";
@@ -72,6 +73,7 @@ interface TaskDetailProps {
   task: Task;
   tasks: Task[];
   currentUser: ActorIdentity;
+  currentUserRole: SessionRole;
   availableLabels: string[];
   workflows: WorkflowOption[];
   developmentScan: DevelopmentScan;
@@ -79,6 +81,11 @@ interface TaskDetailProps {
   commentsRevision: number;
   attachmentsRevision: number;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
+  onReview: (
+    task: Task,
+    decision: "approve" | "request_changes",
+    note?: string,
+  ) => Promise<Task>;
   onOpenTask: (task: TaskRelationSummary) => void;
   onAddRelation: (
     task: Task,
@@ -186,6 +193,7 @@ export function TaskDetail({
   task,
   tasks,
   currentUser,
+  currentUserRole,
   availableLabels,
   workflows,
   developmentScan,
@@ -193,6 +201,7 @@ export function TaskDetail({
   commentsRevision,
   attachmentsRevision,
   onUpdate,
+  onReview,
   onOpenTask,
   onAddRelation,
   onRemoveRelation,
@@ -208,6 +217,8 @@ export function TaskDetail({
   const [editingDescription, setEditingDescription] = useState(false);
   const [labelMenuOpen, setLabelMenuOpen] = useState(false);
   const [savingProperty, setSavingProperty] = useState<string | null>(null);
+  const [reviewNote, setReviewNote] = useState("");
+  const [reviewing, setReviewing] = useState<"approve" | "request_changes" | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachmentsLoading, setAttachmentsLoading] = useState(true);
   const [attachmentsError, setAttachmentsError] = useState<string | null>(null);
@@ -347,6 +358,20 @@ export function TaskDetail({
       return null;
     } finally {
       setSavingProperty(null);
+    }
+  }
+
+  async function submitReview(decision: "approve" | "request_changes") {
+    setReviewing(decision);
+    onError(null);
+    try {
+      const reviewed = await onReview(currentTask, decision, reviewNote);
+      setCurrentTask(reviewed);
+      setReviewNote("");
+    } catch (error) {
+      onError(messageFor(error));
+    } finally {
+      setReviewing(null);
     }
   }
 
@@ -650,6 +675,56 @@ export function TaskDetail({
                 )}
               </div>
             </article>
+
+            {(currentTask.status === "in_review" || currentTask.latestReview) && (
+              <section className="task-review-panel" aria-labelledby="task-review-heading">
+                <header>
+                  <div>
+                    <h2 id="task-review-heading">验收审批</h2>
+                    <p>{currentTask.status === "in_review" ? "任务已提交，等待管理员确认结果。" : "最近一次审批记录"}</p>
+                  </div>
+                  <span className={`task-review-state is-${currentTask.latestReview?.decision ?? "pending"}`}>
+                    {currentTask.status === "in_review"
+                      ? "待审批"
+                      : currentTask.latestReview?.decision === "approved" ? "已通过" : "已退回"}
+                  </span>
+                </header>
+                {currentTask.latestReview && (
+                  <div className="task-review-record">
+                    <strong>{currentTask.latestReview.reviewer.name}</strong>
+                    <span>{currentTask.latestReview.decision === "approved" ? "审批通过" : "要求修改"}</span>
+                    <time title={exactTime(currentTask.latestReview.createdAt)}>{relativeTime(currentTask.latestReview.createdAt)}</time>
+                    {currentTask.latestReview.note && <p>{currentTask.latestReview.note}</p>}
+                  </div>
+                )}
+                {currentTask.status === "in_review" && currentUserRole === "admin" && (
+                  <div className="task-review-actions">
+                    <textarea
+                      value={reviewNote}
+                      placeholder="审批意见（可选）"
+                      rows={3}
+                      maxLength={4000}
+                      disabled={reviewing !== null}
+                      onChange={(event) => setReviewNote(event.target.value)}
+                    />
+                    <div>
+                      <button
+                        className="button secondary"
+                        type="button"
+                        disabled={reviewing !== null}
+                        onClick={() => void submitReview("request_changes")}
+                      >{reviewing === "request_changes" ? "退回中…" : "退回修改"}</button>
+                      <button
+                        className="button primary"
+                        type="button"
+                        disabled={reviewing !== null}
+                        onClick={() => void submitReview("approve")}
+                      >{reviewing === "approve" ? "审批中…" : "审批通过"}</button>
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
 
             <IssueSubIssues
               task={currentTask}
@@ -981,7 +1056,7 @@ export function TaskDetail({
                 disabled={savingProperty === "status"}
                 onChange={(event) => void saveTask({ status: event.target.value as TaskStatus }, "status")}
               >
-                {TASK_STATUSES.map((status) => (
+                {TASK_STATUSES.filter((status) => currentUserRole === "admin" || status !== "done").map((status) => (
                   <option value={status} key={status}>{STATUS_DETAILS[status].label}</option>
                 ))}
               </select>

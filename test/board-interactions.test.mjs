@@ -91,7 +91,7 @@ test("the complete Linear-style workflow shares one ordered status source", () =
   assert.match(boardColumnSource, /canceled: \{ label: "已取消", tone: "canceled" \}/);
   assert.match(cardSource, /import \{ TASK_STATUSES,/);
   assert.doesNotMatch(cardSource, /STATUS_ORDER/);
-  assert.match(detailSource, /TASK_STATUSES\.map\(\(status\) =>/);
+  assert.match(detailSource, /TASK_STATUSES\.filter\(\(status\) => currentUserRole === "admin" \|\| status !== "done"\)\.map\(\(status\) =>/);
   assert.match(editorSource, /TASK_STATUSES\.map\(\(value\) =>/);
   assert.match(contextMenuSource, /TASK_STATUSES\.map\(\(status, index\) =>/);
 });
@@ -171,7 +171,8 @@ test("comments stage, upload, render and delete their own attachments", () => {
   assert.match(apiSource, /\/api\/comments\/\$\{encodeURIComponent\(commentId\)\}\/attachments/);
   assert.match(detailSource, /pendingCommentFiles/);
   assert.match(detailSource, /uploadCommentAttachment\(comment\.id, file\)/);
-  assert.match(detailSource, /comment\.attachments\.map/);
+  assert.match(detailSource, /comment\.attachments\.some\(/);
+  assert.match(detailSource, /className="comment-attachment-list"/);
   assert.match(detailSource, /setPendingAttachmentDelete\(attachment\)/);
 });
 

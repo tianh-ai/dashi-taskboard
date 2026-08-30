@@ -24,17 +24,25 @@ import {
   archiveTask as archiveTaskRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
+  getCurrentSession,
+  listDevices,
+  hideProject as hideProjectRequest,
   getTaskboardRevision,
   getWorkflowWorkspace,
   getTaskboardMetadata,
   listDevelopmentContexts,
   listDeviceWorkspaces,
   listProjects,
+  listHiddenTasks,
+  refreshDevices,
   listTasks,
   moveTask as moveTaskRequest,
   removeTaskRelation,
+  reviewTask as reviewTaskRequest,
   restoreTask as restoreTaskRequest,
+  restoreProject as restoreProjectRequest,
   setCurrentUserActor,
+  taskboardUrl,
   uploadAttachment,
   updateTask as updateTaskRequest,
 } from "./api";
@@ -52,6 +60,8 @@ import {
 } from "./components/InlineMediaComposer";
 import { LinearIcon } from "./components/LinearIcon";
 import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
+import { ProjectMembers } from "./components/ProjectMembers";
+import { ProjectChat } from "./components/ProjectChat";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
 import { TaskEditor } from "./components/TaskEditor";
@@ -70,9 +80,11 @@ import {
   TASK_STATUSES,
   type ActorIdentity,
   type DevelopmentScan,
+  type Device,
   type HostContext,
   type IssueRelationType,
   type Project,
+  type SessionRole,
   type Task,
   type TaskboardMetadata,
   type TaskDraft,
@@ -90,7 +102,7 @@ import { createRevisionPoller, getRevisionPollingInterval } from "./revisionPoll
 
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
-type BoardView = "issues" | "workflow";
+type BoardView = "issues" | "chat" | "workflow";
 const SHOW_WORKFLOW_BOARD_ENTRY = false;
 
 const WorkflowBoard = lazy(() => import("./components/WorkflowBoard").then((module) => ({
@@ -111,9 +123,11 @@ interface ContextMenuState {
 interface ProjectChoice {
   id: string;
   name: string;
+  workspacePath: string | null;
   issueCount: number;
   inCodex: boolean;
   persisted: boolean;
+  devices: Project["devices"];
 }
 
 interface UndoOperation {
@@ -209,6 +223,7 @@ const EVENT_NAMES = [
   "task.created",
   "task.updated",
   "task.moved",
+  "task.reviewed",
   "task.archived",
   "task.restored",
   "task.relation.updated",
@@ -218,6 +233,11 @@ const EVENT_NAMES = [
   "attachment.created",
   "attachment.deleted",
   "project.created",
+  "project.hidden",
+  "project.restored",
+  "project.member.updated",
+  "project.member.removed",
+  "device.projects.synced",
   "workflow.updated",
 ] as const;
 
@@ -242,9 +262,13 @@ function readFavoriteProjectIds(): Set<string> {
   }
 }
 
-function readDeviceWorkspacePaths(): Record<string, string> {
+function deviceWorkspacePathsKey(deviceId: string) {
+  return deviceId ? `${DEVICE_WORKSPACE_PATHS_KEY}.${deviceId}` : DEVICE_WORKSPACE_PATHS_KEY;
+}
+
+function readDeviceWorkspacePaths(deviceId = ""): Record<string, string> {
   try {
-    const value = JSON.parse(window.localStorage.getItem(DEVICE_WORKSPACE_PATHS_KEY) ?? "{}");
+    const value = JSON.parse(window.localStorage.getItem(deviceWorkspacePathsKey(deviceId)) ?? "{}");
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
     return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => (
       typeof entry[1] === "string" && entry[1].trim().length > 0
@@ -440,7 +464,7 @@ function LocalRealtimeSync({
   setAttachmentsRevision,
 }: LocalRealtimeSyncProps) {
   useEffect(() => {
-    const source = new EventSource("/api/events");
+    const source = new EventSource(taskboardUrl("/api/events"));
     let refreshTimer: number | undefined;
     let refreshProjectsPending = false;
     let refreshTasksPending = false;
@@ -470,6 +494,10 @@ function LocalRealtimeSync({
       const affectsSelectedProject = Boolean(selectedProjectId)
         && (!payload.projectId || payload.projectId === selectedProjectId);
       if (event.type === "project.created") {
+        scheduleRefresh({ projects: true });
+        return;
+      }
+      if (event.type === "device.projects.synced") {
         scheduleRefresh({ projects: true });
         return;
       }
@@ -531,15 +559,25 @@ function LocalRealtimeSync({
 export function App() {
   const query = useMemo(() => new URLSearchParams(window.location.search), []);
   const embedded = query.get("host") === "codex";
+  const requestedDeviceId = query.get("device")?.trim() ?? "";
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [hostContext, setHostContext] = useState<HostContext | null>(null);
+  const [sessionUser, setSessionUser] = useState<ActorIdentity>(DEFAULT_USER_ACTOR);
+  const [sessionRole, setSessionRole] = useState<SessionRole>("admin");
+  const [membersOpen, setMembersOpen] = useState(false);
   const [developmentScan, setDevelopmentScan] = useState<DevelopmentScan>({ workspacePath: null, contexts: [] });
   const [developmentScanLoading, setDevelopmentScanLoading] = useState(false);
   const [manageTaskboardSkillPath, setManageTaskboardSkillPath] = useState("");
   const [taskboardMetadata, setTaskboardMetadata] = useState<TaskboardMetadata | null>(null);
   const [localAiChatAvailable, setLocalAiChatAvailable] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [hiddenProjects, setHiddenProjects] = useState<Project[]>([]);
+  const [hiddenTasks, setHiddenTasks] = useState<Task[]>([]);
+  const [hiddenItemsOpen, setHiddenItemsOpen] = useState(false);
+  const [hiddenItemsLoading, setHiddenItemsLoading] = useState(false);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [devicesSyncing, setDevicesSyncing] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
@@ -571,7 +609,9 @@ export function App() {
   const [openingThreadTaskId, setOpeningThreadTaskId] = useState<string | null>(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [favoriteProjectIds, setFavoriteProjectIds] = useState(readFavoriteProjectIds);
-  const [deviceWorkspacePaths, setDeviceWorkspacePaths] = useState(readDeviceWorkspacePaths);
+  const [deviceWorkspacePaths, setDeviceWorkspacePaths] = useState(
+    () => readDeviceWorkspacePaths(requestedDeviceId),
+  );
   const [projectAutomations, setProjectAutomations] = useState(readProjectAutomations);
   const [automationPending, setAutomationPending] = useState(false);
   const [automationError, setAutomationError] = useState<string | null>(null);
@@ -605,13 +645,14 @@ export function App() {
       const next = { ...current };
       if (normalizedPath) next[projectId] = normalizedPath;
       else delete next[projectId];
-      window.localStorage.setItem(DEVICE_WORKSPACE_PATHS_KEY, JSON.stringify(next));
+      window.localStorage.setItem(deviceWorkspacePathsKey(requestedDeviceId), JSON.stringify(next));
       return next;
     });
-  }, []);
+  }, [requestedDeviceId]);
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
-  const currentUser = hostContext?.user ?? DEFAULT_USER_ACTOR;
+  const requestedDevice = devices.find((device) => device.id === requestedDeviceId) ?? null;
+  const currentUser = hostContext?.user ?? sessionUser;
   const selectedDeviceWorkspacePath = deviceWorkspacePaths[selectedProjectId];
   const selectedProjectAutomation = projectAutomations[selectedProjectId];
   const automationProjectContext = useMemo(() => {
@@ -669,17 +710,20 @@ export function App() {
   );
   const projectChoices = useMemo<ProjectChoice[]>(() => {
     const persistedById = new Map(projects.map((project) => [project.id, project]));
+    const hiddenIds = new Set(hiddenProjects.map((project) => project.id));
     const seen = new Set<string>();
     const choices: ProjectChoice[] = [];
     for (const project of hostContext?.projects ?? []) {
-      if (!project.id || !project.name || seen.has(project.id)) continue;
+      if (!project.id || !project.name || seen.has(project.id) || hiddenIds.has(project.id)) continue;
       seen.add(project.id);
       choices.push({
         id: project.id,
         name: persistedById.get(project.id)?.name ?? project.name,
+        workspacePath: persistedById.get(project.id)?.workspacePath ?? null,
         issueCount: persistedById.get(project.id)?.issueCount ?? 0,
         inCodex: true,
         persisted: persistedById.has(project.id),
+        devices: persistedById.get(project.id)?.devices,
       });
     }
     for (const project of projects) {
@@ -687,15 +731,17 @@ export function App() {
       choices.push({
         id: project.id,
         name: project.name,
+        workspacePath: project.workspacePath,
         issueCount: project.issueCount,
         inCodex: false,
         persisted: true,
+        devices: project.devices,
       });
     }
     return choices.sort((left, right) => (
       Number(favoriteProjectIds.has(right.id)) - Number(favoriteProjectIds.has(left.id))
     ));
-  }, [favoriteProjectIds, hostContext?.projects, projects]);
+  }, [favoriteProjectIds, hiddenProjects, hostContext?.projects, projects]);
   const projectsWithIssues = useMemo(
     () => projectChoices.filter((project) => project.issueCount > 0),
     [projectChoices],
@@ -704,7 +750,24 @@ export function App() {
     () => projectChoices.filter((project) => project.issueCount === 0),
     [projectChoices],
   );
+  const projectNameById = useMemo(() => new Map(
+    [...projects, ...hiddenProjects].map((project) => [project.id, project.name]),
+  ), [hiddenProjects, projects]);
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
+
+  useEffect(() => {
+    if (embedded) return;
+    const controller = new AbortController();
+    void getCurrentSession(controller.signal).then((session) => {
+      setSessionUser(session.user);
+      setSessionRole(session.role);
+      setCurrentUserActor(session.user);
+    }).catch((error) => {
+      if (error instanceof Error && error.name === "AbortError") return;
+      setActionError(errorMessage(error));
+    });
+    return () => controller.abort();
+  }, [embedded]);
 
   const writeProjectAutomation = useCallback((
     projectId: string,
@@ -1069,8 +1132,10 @@ export function App() {
     setProjectsLoading(true);
     setLoadError(null);
     try {
-      const [nextProjects, metadata, workspaces] = await Promise.all([
+      const [nextProjects, nextHiddenProjects, nextDevices, metadata, workspaces] = await Promise.all([
         listProjects(signal),
+        listProjects(signal, "true"),
+        listDevices(signal),
         getTaskboardMetadata(signal),
         listDeviceWorkspaces(signal),
       ]);
@@ -1086,13 +1151,32 @@ export function App() {
       ));
       setManageTaskboardSkillPath(metadata.manageTaskboardSkillPath ?? "");
       setLocalAiChatAvailable(metadata.capabilities?.localAiChat === true);
+      const requestedWorkspaces: Record<string, string> = {};
+      if (requestedDeviceId && nextDevices.some((device) => device.id === requestedDeviceId)) {
+        for (const project of nextProjects) {
+          const mapping = project.devices?.find((device) => device.deviceId === requestedDeviceId);
+          if (mapping?.workspacePath) requestedWorkspaces[project.id] = mapping.workspacePath;
+        }
+      }
+      const importedWorkspaces = Object.keys(requestedWorkspaces).length > 0
+        ? requestedWorkspaces
+        : workspaces;
       setDeviceWorkspacePaths((current) => {
-        const next = { ...current, ...workspaces };
+        const next = { ...current, ...importedWorkspaces };
+        if (!requestedDeviceId) {
+          for (const project of nextProjects) {
+            if (workspaces[project.id]) continue;
+            const remotePaths = project.devices?.map((device) => device.workspacePath) ?? [];
+            if (next[project.id] && remotePaths.includes(next[project.id])) delete next[project.id];
+          }
+        }
         if (JSON.stringify(next) === JSON.stringify(current)) return current;
-        window.localStorage.setItem(DEVICE_WORKSPACE_PATHS_KEY, JSON.stringify(next));
+        window.localStorage.setItem(deviceWorkspacePathsKey(requestedDeviceId), JSON.stringify(next));
         return next;
       });
       setProjects(nextProjects);
+      setHiddenProjects(nextHiddenProjects);
+      setDevices(nextDevices);
       setSelectedProjectId((current) => {
         const fromQuery = new URLSearchParams(window.location.search).get("project");
         const remembered = window.localStorage.getItem(LAST_PROJECT_KEY);
@@ -1106,7 +1190,7 @@ export function App() {
     } finally {
       setProjectsLoading(false);
     }
-  }, []);
+  }, [requestedDeviceId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1116,11 +1200,32 @@ export function App() {
 
   const refreshProjectList = useCallback(async () => {
     try {
-      setProjects(await listProjects());
+      const [nextProjects, nextHiddenProjects, nextDevices] = await Promise.all([
+        listProjects(),
+        listProjects(undefined, "true"),
+        listDevices(),
+      ]);
+      setProjects(nextProjects);
+      setHiddenProjects(nextHiddenProjects);
+      setDevices(nextDevices);
     } catch (error) {
       setLoadError(errorMessage(error));
     }
   }, []);
+
+  const syncDeviceProjects = useCallback(async () => {
+    setDevicesSyncing(true);
+    setActionError(null);
+    try {
+      await refreshDevices();
+      await refreshProjectList();
+      setAnnouncement("两台设备的项目和 Codex 任务已更新。");
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setDevicesSyncing(false);
+    }
+  }, [refreshProjectList, setAnnouncement]);
 
   const refreshTasks = useCallback(async (
     projectId: string,
@@ -1475,6 +1580,10 @@ export function App() {
     beforeTaskId: string | null = null,
     silent = false,
   ) {
+    if (status === "done" && sessionRole !== "admin") {
+      setActionError("完成状态需要项目管理员审批。请先移至待审核。");
+      return;
+    }
     if (movingTaskId) {
       setDropTarget(null);
       setDraggedTaskId(null);
@@ -1543,6 +1652,30 @@ export function App() {
       setDropTarget(null);
       setDraggedTaskId(null);
       setDraggedTaskHeight(0);
+    }
+  }
+
+  async function reviewTask(
+    task: Task,
+    decision: "approve" | "request_changes",
+    note?: string,
+  ): Promise<Task> {
+    setActionError(null);
+    try {
+      const reviewed = await reviewTaskRequest(task, decision, note);
+      setTasks((current) => sortTasks(current.map((candidate) => (
+        candidate.id === reviewed.id ? reviewed : candidate
+      ))));
+      setAnnouncement(decision === "approve"
+        ? `${reviewed.identifier} 已审批通过。`
+        : `${reviewed.identifier} 已退回修改。`);
+      return reviewed;
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "VERSION_CONFLICT" && selectedProjectId) {
+        void refreshTasks(selectedProjectId, { quiet: true });
+      }
+      setActionError(errorMessage(error));
+      throw error;
     }
   }
 
@@ -1649,7 +1782,7 @@ export function App() {
     try {
       const archived = await archiveTaskRequest(task);
       setTasks((current) => current.filter((candidate) => candidate.id !== task.id));
-      pushUndo(`${task.identifier} 已归档。`, async () => {
+      pushUndo(`${task.identifier} 已隐藏。`, async () => {
         const restored = await restoreTaskRequest(archived);
         setTasks((current) => sortTasks([
           ...current.filter((candidate) => candidate.id !== restored.id),
@@ -1661,6 +1794,85 @@ export function App() {
         ? "该议题已在其他位置更新，看板已重新同步。"
         : errorMessage(error));
       if (selectedProjectId) void refreshTasks(selectedProjectId, { quiet: true });
+    }
+  }
+
+  async function toggleHiddenItems() {
+    const nextOpen = !hiddenItemsOpen;
+    setHiddenItemsOpen(nextOpen);
+    if (!nextOpen) return;
+    setHiddenItemsLoading(true);
+    setActionError(null);
+    try {
+      const [nextHiddenProjects, nextHiddenTasks] = await Promise.all([
+        listProjects(undefined, "true"),
+        listHiddenTasks(),
+      ]);
+      setHiddenProjects(nextHiddenProjects);
+      setHiddenTasks(nextHiddenTasks);
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setHiddenItemsLoading(false);
+    }
+  }
+
+  async function hideProject(projectId: string) {
+    const project = projects.find((candidate) => candidate.id === projectId);
+    if (!project) return;
+    setActionError(null);
+    try {
+      const hidden = await hideProjectRequest(project);
+      setProjects((current) => current.filter((candidate) => candidate.id !== project.id));
+      setHiddenProjects((current) => [
+        ...current.filter((candidate) => candidate.id !== hidden.id),
+        hidden,
+      ]);
+      setFavoriteProjectIds((current) => {
+        if (!current.has(project.id)) return current;
+        const next = new Set(current);
+        next.delete(project.id);
+        window.localStorage.setItem(FAVORITE_PROJECTS_KEY, JSON.stringify([...next]));
+        return next;
+      });
+      setAnnouncement(`${project.name} 已隐藏，数据仍然保留。`);
+    } catch (error) {
+      setActionError(errorMessage(error));
+      await refreshProjectList();
+    }
+  }
+
+  async function restoreHiddenProject(project: Project) {
+    setActionError(null);
+    try {
+      const restored = await restoreProjectRequest(project);
+      setHiddenProjects((current) => current.filter((candidate) => candidate.id !== restored.id));
+      setProjects((current) => [
+        ...current.filter((candidate) => candidate.id !== restored.id),
+        restored,
+      ]);
+      setAnnouncement(`${restored.name} 已恢复显示。`);
+    } catch (error) {
+      setActionError(errorMessage(error));
+      await refreshProjectList();
+    }
+  }
+
+  async function restoreHiddenTask(task: Task) {
+    setActionError(null);
+    try {
+      const restored = await restoreTaskRequest(task);
+      setHiddenTasks((current) => current.filter((candidate) => candidate.id !== restored.id));
+      setProjects((current) => current.map((project) => (
+        project.id === restored.projectId
+          ? { ...project, issueCount: project.issueCount + 1 }
+          : project
+      )));
+      setAnnouncement(`${restored.identifier} 已恢复显示。`);
+    } catch (error) {
+      setActionError(errorMessage(error));
+      const nextHiddenTasks = await listHiddenTasks().catch(() => null);
+      if (nextHiddenTasks) setHiddenTasks(nextHiddenTasks);
     }
   }
 
@@ -1991,6 +2203,23 @@ export function App() {
 
           <div className="header-actions">
             {selectedProjectId && (
+              <div
+                className={`session-role-badge is-${sessionRole}`}
+                aria-label={`当前身份：${currentUser.name}，${sessionRole === "admin" ? "管理员" : "项目成员"}`}
+                title={`当前身份：${currentUser.name}`}
+              >
+                <span>{currentUser.name}</span>
+                <strong>{sessionRole === "admin" ? "管理员" : "成员"}</strong>
+              </div>
+            )}
+            {selectedProject && sessionRole === "admin" && (
+              <button
+                className="button secondary header-members-button"
+                type="button"
+                onClick={() => setMembersOpen(true)}
+              >成员管理</button>
+            )}
+            {selectedProjectId && (
               <ProjectAutomationMenu
                 automation={selectedProjectAutomation}
                 pending={automationPending}
@@ -2026,6 +2255,14 @@ export function App() {
               onClick={() => selectBoardView("issues")}
             >
               议题看板
+            </button>
+            <button
+              className={`view-tab${boardView === "chat" ? " active" : ""}`}
+              type="button"
+              aria-pressed={boardView === "chat"}
+              onClick={() => selectBoardView("chat")}
+            >
+              项目群聊
             </button>
             {SHOW_WORKFLOW_BOARD_ENTRY && (
               <button
@@ -2098,8 +2335,91 @@ export function App() {
             <div className="project-home-heading">
               <span>任务面板</span>
               <h1>选择项目</h1>
-              <p>从 Codex 项目开始，或继续使用之前保存的项目。</p>
+              <p>
+                统一查看 Mac Mini 与 MacBook Pro 上的项目和议题。
+                {requestedDevice ? ` 当前目录上下文：${requestedDevice.name}。` : ""}
+              </p>
+              <button
+                className="hidden-items-button"
+                type="button"
+                aria-expanded={hiddenItemsOpen}
+                onClick={() => void toggleHiddenItems()}
+              >
+                <LinearIcon name="linkOff" />
+                隐藏项{hiddenProjects.length > 0 || hiddenTasks.length > 0
+                  ? ` (${hiddenProjects.length + hiddenTasks.length})`
+                  : ""}
+              </button>
             </div>
+            {hiddenItemsOpen && (
+              <section className="hidden-items-panel" aria-label="隐藏项管理">
+                <div className="hidden-items-heading">
+                  <div>
+                    <strong>隐藏项</strong>
+                    <span>数据不会删除，自动同步也不会重新显示。</span>
+                  </div>
+                  <button type="button" onClick={() => void toggleHiddenItems()} aria-label="关闭隐藏项">
+                    <LinearIcon name="close" />
+                  </button>
+                </div>
+                {hiddenItemsLoading ? (
+                  <p className="hidden-items-empty">正在读取隐藏项…</p>
+                ) : hiddenProjects.length === 0 && hiddenTasks.length === 0 ? (
+                  <p className="hidden-items-empty">暂无隐藏项目或任务。</p>
+                ) : (
+                  <div className="hidden-items-groups">
+                    <div>
+                      <h2>项目 <span>{hiddenProjects.length}</span></h2>
+                      {hiddenProjects.map((project) => (
+                        <div className="hidden-item" key={project.id}>
+                          <div><strong>{project.name}</strong><span>{project.issueCount} 个保留任务</span></div>
+                          <button type="button" onClick={() => void restoreHiddenProject(project)}>恢复显示</button>
+                        </div>
+                      ))}
+                    </div>
+                    <div>
+                      <h2>任务 <span>{hiddenTasks.length}</span></h2>
+                      {hiddenTasks.map((task) => (
+                        <div className="hidden-item" key={task.id}>
+                          <div>
+                            <strong>{task.title}</strong>
+                            <span>{task.identifier} · {projectNameById.get(task.projectId) ?? task.projectId}</span>
+                          </div>
+                          <button type="button" onClick={() => void restoreHiddenTask(task)}>恢复显示</button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
+            <section className="device-overview" aria-label="设备同步状态">
+              <div className="device-overview-heading">
+                <div>
+                  <strong>设备</strong>
+                  <span>{devices.filter((device) => device.status === "online").length}/{devices.length} 在线</span>
+                </div>
+                <button type="button" disabled={devicesSyncing} onClick={() => void syncDeviceProjects()}>
+                  {devicesSyncing ? "正在同步…" : "立即同步"}
+                </button>
+              </div>
+              <div className="device-list">
+                {devices.map((device) => (
+                  <div className={`device-item device-${device.status}`} key={device.id} title={device.lastError ?? device.hostname ?? undefined}>
+                    <span className="device-status-dot" aria-hidden="true" />
+                    <div>
+                      <strong>{device.name}</strong>
+                      <span>
+                        {device.status === "online"
+                          ? `${device.projectCount} 个项目 · ${device.taskCount} 个任务`
+                          : device.lastError ?? "设备不可用"}
+                        {device.lastSeenAt ? ` · ${new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(new Date(device.lastSeenAt))}` : ""}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
             {projectsLoading ? (
               <div className="project-grid project-grid-loading" aria-label="正在加载项目" aria-busy="true">
                 <span /><span /><span />
@@ -2134,20 +2454,44 @@ export function App() {
                                   {project.inCodex ? "Codex 项目" : "已保存的项目"}
                                   {project.issueCount > 0 ? ` · ${project.issueCount} 个议题` : ""}
                                 </span>
+                                {project.devices && project.devices.length > 0 && (
+                                  <span>{project.devices.map((device) => device.deviceName).join(" · ")}</span>
+                                )}
                               </span>
                               {favoriteProjectIds.has(project.id) && <span className="project-card-favorite" aria-label="已收藏"><LinearIcon name="favorite" /></span>}
                               <span className="project-card-action" aria-hidden="true">
                                 {openingProjectId === project.id ? "正在打开…" : <LinearIcon name="chevronRight" />}
                               </span>
                             </button>
+                            {project.persisted && (
+                              <button
+                                className="project-card-hide"
+                                type="button"
+                                aria-label={`隐藏项目 ${project.name}`}
+                                title="隐藏项目"
+                                onClick={() => void hideProject(project.id)}
+                              >
+                                <LinearIcon name="linkOff" />
+                              </button>
+                            )}
+                            {project.devices && project.devices.length > 0 && (
+                              <div className="project-device-paths" aria-label={`${project.name} 的设备目录`}>
+                                {project.devices.map((device) => (
+                                  <div key={device.deviceId}>
+                                    <span>{device.deviceName}</span>
+                                    <code title={device.workspacePath}>{device.workspacePath}</code>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                             <label className="project-card-directory">
                               <LinearIcon name="folder" />
                               <input
-                                key={deviceWorkspacePaths[project.id] ?? ""}
+                                key={deviceWorkspacePaths[project.id] ?? project.workspacePath ?? ""}
                                 type="text"
-                                defaultValue={deviceWorkspacePaths[project.id] ?? ""}
+                                defaultValue={deviceWorkspacePaths[project.id] ?? project.workspacePath ?? ""}
                                 placeholder="设置此设备的项目目录"
-                                aria-label={`${project.name} 在此设备上的项目目录`}
+                                aria-label={`${project.name} 在${requestedDevice?.name ?? "此设备"}上的项目目录`}
                                 onBlur={(event) => rememberDeviceWorkspacePath(project.id, event.currentTarget.value)}
                                 onKeyDown={(event) => {
                                   if (event.key === "Enter") event.currentTarget.blur();
@@ -2177,6 +2521,7 @@ export function App() {
             task={detailTask}
             tasks={tasks}
             currentUser={currentUser}
+            currentUserRole={sessionRole}
             availableLabels={availableLabels}
             workflows={workflowOptions}
             developmentScan={developmentScan}
@@ -2184,6 +2529,7 @@ export function App() {
             commentsRevision={commentsRevision}
             attachmentsRevision={attachmentsRevision}
             onUpdate={(current, changes) => updateTaskProperties(current, changes)}
+            onReview={reviewTask}
             onOpenTask={openTaskDetail}
             onAddRelation={(current, type, relatedTaskId) => (
               mutateTaskRelation("add", current, type, relatedTaskId)
@@ -2196,6 +2542,14 @@ export function App() {
             openingThread={openingThreadTaskId === detailTask.id}
             onError={setActionError}
             onAnnounce={setAnnouncement}
+          />
+        ) : boardView === "chat" && selectedProject ? (
+          <ProjectChat
+            key={selectedProject.id}
+            project={selectedProject}
+            currentUser={currentUser}
+            tasks={tasks}
+            onOpenTask={openTaskDetail}
           />
         ) : boardView === "workflow" ? (
           <Suspense fallback={<div className="workflow-board-loading">正在打开节点模式…</div>}>
@@ -2299,6 +2653,10 @@ export function App() {
           onCancel={() => setEditor(null)}
           onSave={saveEditor}
         />
+      )}
+
+      {membersOpen && selectedProject && (
+        <ProjectMembers project={selectedProject} onClose={() => setMembersOpen(false)} />
       )}
 
       {contextMenu && contextMenuTask && (

@@ -18,6 +18,9 @@ test("issue title and description keep Linear-style inline editing when focused"
 });
 
 test("editing and composing comments do not add focus chrome", () => {
-  assert.equal([...detailSource.matchAll(/className="comment-input"/g)].length, 2);
+  // The inline-media composer renders its own input; only the edit form
+  // still uses the plain comment-input textarea.
+  assert.equal([...detailSource.matchAll(/className="comment-input"/g)].length, 1);
   assert.doesNotMatch(styles, /\.comment-composer:focus-within\s*\{/);
+  assert.doesNotMatch(styles, /\.comment-input:focus\s*\{/);
 });

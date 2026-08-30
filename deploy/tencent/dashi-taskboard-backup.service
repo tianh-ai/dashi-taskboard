@@ -1,0 +1,21 @@
+[Unit]
+Description=Back up Dashi Taskboard data
+After=dashi-taskboard.service
+
+[Service]
+Type=oneshot
+User=dashi-taskboard
+Group=dashi-taskboard
+WorkingDirectory=/opt/dashi-taskboard/current
+EnvironmentFile=/etc/dashi-taskboard/env
+Environment=PATH=/opt/dashi-taskboard/node/bin:/usr/bin:/bin
+ExecStart=/opt/dashi-taskboard/node/bin/node scripts/backup-local-data.mjs
+ExecStart=/opt/dashi-taskboard/current/scripts/sync-backups-to-nas.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dashi-taskboard
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

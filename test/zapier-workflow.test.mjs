@@ -15,7 +15,7 @@ test("workflow editing is a constrained vertical execution sequence instead of a
   assert.match(board, /normalizeWorkflowSnapshot/);
   assert.match(board, /deriveWorkflowLayout/);
   assert.match(board, /insertWorkflowNode/);
-  assert.match(board, /moveWorkflowNode/);
+  assert.match(board, /reorderPlanItem/);
   assert.match(board, /edgeTypes=\{EDGE_TYPES\}/);
   assert.match(board, /nodeOrigin=\{TOP_CENTER_ORIGIN\}/);
   assert.match(board, /nodesConnectable=\{false\}/);
@@ -217,7 +217,7 @@ test("deleting a condition removes its subtree, while conditions move as one sub
   );
   assert.match(
     board,
-    /moveWorkflowNode\([\s\S]*?session\.sequenceRef/,
+    /onNodeDragStop[\s\S]*?reorderPlanItem\(session\.parentId/,
   );
 });
 

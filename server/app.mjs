@@ -24,6 +24,11 @@ import {
   isLocalCompanionRoute,
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
+import {
+  createDeviceProjectSync,
+  resolveDeviceProjectSyncConfig,
+} from "./device-project-sync.mjs";
+import { createWeComAuth, resolveWeComConfig } from "./wecom-auth.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -81,7 +86,14 @@ function sendEmpty(response, status, headers = {}) {
   response.end();
 }
 
-function toFetchRequest(request) {
+function workBuddyToolResult(value, isError = false) {
+  return {
+    content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) }],
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+function toFetchRequest(request, normalizedPath = request.url) {
   const headers = new Headers();
   for (const [name, value] of Object.entries(request.headers)) {
     if (Array.isArray(value)) {
@@ -90,12 +102,20 @@ function toFetchRequest(request) {
       headers.set(name, value);
     }
   }
+  if (request.taskboardActor?.type === "user") {
+    headers.set("x-taskboard-client", "cloud-companion");
+    headers.set("x-taskboard-acting-user-id", request.taskboardActor.id);
+    headers.set("x-taskboard-acting-user-name", encodeURIComponent(request.taskboardActor.name));
+    if (request.taskboardActor.avatarUrl) {
+      headers.set("x-taskboard-acting-user-avatar", request.taskboardActor.avatarUrl);
+    }
+  }
   const init = { method: request.method, headers };
   if (request.method !== "GET" && request.method !== "HEAD") {
     init.body = Readable.toWeb(request);
     init.duplex = "half";
   }
-  return new Request(`http://127.0.0.1${request.url}`, init);
+  return new Request(`http://127.0.0.1${normalizedPath}`, init);
 }
 
 async function sendFetchResponse(response, upstream) {
@@ -150,14 +170,15 @@ function isTrustedNetworkHost(hostname) {
   return false;
 }
 
-function assertTrustedNetworkRequest(request) {
+function assertTrustedNetworkRequest(request, trustedOrigin = null) {
   let host;
   try {
     host = new URL(`http://${request.headers.host ?? ""}`).hostname;
   } catch {
     throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
   }
-  if (!isTrustedNetworkHost(host)) {
+  const trustedPublicHost = trustedOrigin ? new URL(trustedOrigin).hostname : null;
+  if (!isTrustedNetworkHost(host) && host !== trustedPublicHost) {
     throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
   }
 
@@ -170,7 +191,7 @@ function assertTrustedNetworkRequest(request) {
   } catch {
     throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
   }
-  if (!isTrustedNetworkHost(originHost)) {
+  if (!isTrustedNetworkHost(originHost) && origin !== trustedOrigin) {
     throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
   }
 }
@@ -458,6 +479,14 @@ function slugify(value) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
 }
 
+function workbuddyProjectMappingId(workbuddyProjectId) {
+  let slug = slugify(workbuddyProjectId).slice(0, 60);
+  if (!slug) {
+    slug = [...workbuddyProjectId].reduce((hash, ch) => (hash * 31 + ch.codePointAt(0)) >>> 0, 7).toString(36);
+  }
+  return `wb-${slug}`.replace(/-+$/g, "") || "wb-project";
+}
+
 function validateProjectId(value, { required = true } = {}) {
   const id = stringField(value, "id", { required, maxLength: 64 });
   if (id !== undefined && !PROJECT_ID_PATTERN.test(id)) {
@@ -495,6 +524,7 @@ function requestHeader(request, name) {
 }
 
 function actorFromRequest(request) {
+  if (request.taskboardActor) return request.taskboardActor;
   if (request.headers["x-taskboard-client"] === "taskctl") {
     return CODEX_AGENT_ACTOR;
   }
@@ -536,6 +566,194 @@ function actorFromRequest(request) {
     avatarUrl = parsed.toString();
   }
   return { type: "user", id, name, avatarUrl };
+}
+
+function assertAdmin(request) {
+  const actor = actorFromRequest(request);
+  if (actor.type !== "user" || request.taskboardRole !== "admin") {
+    throw new ApiError(403, "ADMIN_REQUIRED", "此操作需要项目管理员权限");
+  }
+}
+
+function projectMembershipForRequest(request, database, projectId) {
+  const actor = actorFromRequest(request);
+  if (actor.type !== "user") return null;
+  return database.getProjectMembership(projectId, actor.id);
+}
+
+function assertProjectAdmin(request, database, projectId) {
+  const actor = actorFromRequest(request);
+  const isGlobalHumanAdmin = actor.type === "user" && request.taskboardRole === "admin";
+  const membership = projectMembershipForRequest(request, database, projectId);
+  if (!isGlobalHumanAdmin && membership?.role !== "admin") {
+    throw new ApiError(403, "PROJECT_ADMIN_REQUIRED", "此操作需要真实用户的项目管理员权限");
+  }
+}
+
+function assertAgentActor(request) {
+  if (request.taskboardActor?.type !== "agent") {
+    throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Agent credentials (Basic + x-taskboard-client) are required");
+  }
+}
+
+function isWorkBuddyBridge(request) {
+  return request.taskboardActor?.type === "agent"
+    && request.taskboardActor.id.endsWith(":workbuddy-bridge");
+}
+
+function assertWorkBuddyBridge(request) {
+  if (!isWorkBuddyBridge(request)) {
+    throw new ApiError(403, "WORKBUDDY_BRIDGE_REQUIRED", "WorkBuddy bridge credentials are required");
+  }
+}
+
+function canAccessProject(request, database, projectId) {
+  const actor = actorFromRequest(request);
+  // Agents are trusted workers: they may read and work on any project, the
+  // same reach dashi_claim_task already grants over MCP. Governance mutations
+  // (done status, review, member/admin management) stay gated to humans via
+  // assertProjectAdmin/assertAdmin, which never accept agent actors.
+  if (actor.type === "agent") return true;
+  if (actor.type === "user" && request.taskboardRole === "admin") return true;
+  return actor.type === "user" && Boolean(database.getProjectMembership(projectId, actor.id));
+}
+
+function assertProjectAccess(request, database, projectId) {
+  if (!canAccessProject(request, database, projectId)) {
+    throw new ApiError(403, "PROJECT_ACCESS_DENIED", "你不是此项目的成员");
+  }
+}
+
+function parseProjectMember(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["userId", "userName", "userAvatarUrl", "role"]));
+  const role = body.role;
+  if (!["member", "manager", "admin"].includes(role)) {
+    throw new ApiError(400, "INVALID_FIELD", "'role' must be member, manager, or admin");
+  }
+  return {
+    userId: stringField(body.userId, "userId", { required: true, maxLength: 96 }),
+    userName: stringField(body.userName, "userName", { required: true, maxLength: 120 }),
+    userAvatarUrl: stringField(body.userAvatarUrl ?? null, "userAvatarUrl", { nullable: true, maxLength: 2048 }),
+    role,
+  };
+}
+
+function parseProjectMessage(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["body", "kind", "mentions", "taskId", "replyToMessageId"]));
+  const kind = body.kind ?? "message";
+  if (!["message", "progress", "decision"].includes(kind)) {
+    throw new ApiError(400, "INVALID_FIELD", "'kind' must be message, progress, or decision");
+  }
+  if (body.mentions !== undefined && !Array.isArray(body.mentions)) {
+    throw new ApiError(400, "INVALID_FIELD", "'mentions' must be an array");
+  }
+  const mentions = [...new Set((body.mentions ?? []).map((value) => (
+    stringField(value, "mentions[]", { required: true, maxLength: 96 })
+  )))].slice(0, 20);
+  return {
+    body: stringField(body.body, "body", { required: true, maxLength: 100_000 }),
+    kind,
+    mentions,
+    taskId: stringField(body.taskId ?? null, "taskId", { nullable: true, maxLength: 128 }),
+    replyToMessageId: stringField(
+      body.replyToMessageId ?? null,
+      "replyToMessageId",
+      { nullable: true, maxLength: 128 },
+    ),
+  };
+}
+
+const AGENT_DEFAULT_LEASE_SECONDS = 15 * 60;
+const AGENT_MAX_LEASE_SECONDS = 24 * 60 * 60;
+
+function agentUsernameFromActor(actor) {
+  if (actor?.type !== "agent") return null;
+  if (typeof actor.username === "string" && actor.username) return actor.username;
+  // Legacy/basic fallback: "basic:<username>:<client>"
+  const match = /^basic:([^:]+):/.exec(actor.id ?? "");
+  if (match) return decodeURIComponent(match[1]);
+  return null;
+}
+
+function agentActorFromRegistry(agent) {
+  if (!agent) return null;
+  return {
+    type: "agent",
+    id: `agent:${agent.id}`,
+    name: agent.device ? `${agent.name}·${agent.device}` : agent.name,
+    avatarUrl: null,
+  };
+}
+
+function resolveAgentAuthor(database, actor) {
+  if (actor?.type !== "agent") return actor;
+  const username = agentUsernameFromActor(actor);
+  if (!username || username === "workbuddy-agent") return actor;
+  return agentActorFromRegistry(database.getAgent(username)) ?? actor;
+}
+
+function dispatchAgentMentions(database, events, projectId, message) {
+  if (
+    message.author.type !== "user"
+    || !message.mentions
+    || message.mentions.length === 0
+  ) return null;
+  const targets = [];
+  let anyAgent = false;
+  for (const mention of message.mentions) {
+    if (mention === "agent" || mention === "agents" || mention === "codex-agent") {
+      anyAgent = true;
+      continue;
+    }
+    const mentionedAgents = database.findAgentsByMention(mention);
+    for (const agent of mentionedAgents) {
+      if (!targets.some((target) => target.id === agent.id)) {
+        targets.push({ id: agent.id, name: agent.name, device: agent.device });
+      }
+    }
+  }
+  if (!anyAgent && targets.length === 0) return null;
+  const request = message.taskId
+    ? { task: database.getTask(message.taskId), created: false, dispatchSequence: null }
+    : database.ensureAgentRequestTask(projectId, message);
+  if (!request.task) return null;
+  if (request.dispatchSequence !== null) return null;
+  const dispatch = {
+    type: "agent.dispatch",
+    projectId,
+    messageId: message.id,
+    taskId: request.task.id,
+    body: message.body,
+    anyAgent,
+    targets,
+    at: message.createdAt,
+  };
+  if (request.created) events.emit("task.created", { task: request.task });
+  const sequence = database.appendIntegrationEvent("agents", dispatch);
+  if (!message.taskId) database.recordAgentRequestDispatch(message.id, sequence);
+  events.emit("project.agent.requested", { projectId, message, dispatch });
+  return dispatch;
+}
+
+function agentSystemMessage(database, events, projectId, body, taskId = null) {
+  const message = database.createProjectMessage(projectId, {
+    body,
+    kind: "progress",
+    taskId,
+    actor: { type: "agent", id: "agent:dispatcher", name: "调度系统", avatarUrl: null },
+  });
+  events.emit("project.message.created", { projectId, message });
+  return message;
+}
+
+function boundedLeaseSeconds(value) {
+  const seconds = Number(value ?? AGENT_DEFAULT_LEASE_SECONDS);
+  if (!Number.isInteger(seconds) || seconds < 30 || seconds > AGENT_MAX_LEASE_SECONDS) {
+    throw new ApiError(400, "INVALID_FIELD", "'leaseSeconds' must be an integer between 30 and 86400");
+  }
+  return seconds;
 }
 
 function parseAssigneeTarget(value) {
@@ -770,6 +988,23 @@ function parseTaskFilters(searchParams) {
   return { projectId, status: statusValue ?? undefined, archived };
 }
 
+function parseProjectFilters(searchParams) {
+  const allowed = new Set(["hidden"]);
+  for (const key of searchParams.keys()) {
+    if (!allowed.has(key)) {
+      throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", `Unknown query parameter '${key}'`);
+    }
+    if (searchParams.getAll(key).length !== 1) {
+      throw new ApiError(400, "INVALID_QUERY_PARAMETER", `Query parameter '${key}' cannot be repeated`);
+    }
+  }
+  const hidden = searchParams.get("hidden") ?? "false";
+  if (!new Set(["true", "false", "all"]).has(hidden)) {
+    throw new ApiError(400, "INVALID_QUERY_PARAMETER", "'hidden' must be true, false, or all");
+  }
+  return { hidden };
+}
+
 function parseAiSandbox(value) {
   if (value === undefined) return undefined;
   if (!["read-only", "workspace-write", "danger-full-access"].includes(value)) {
@@ -928,15 +1163,16 @@ function parseAiTurn(body) {
 }
 
 class EventHub {
-  constructor() {
+  constructor(onEmit = null) {
     this.clients = new Set();
+    this.onEmit = onEmit;
     this.keepAlive = setInterval(() => {
-      for (const response of this.clients) response.write(": keep-alive\n\n");
+      for (const client of this.clients) client.response.write(": keep-alive\n\n");
     }, 20_000);
     this.keepAlive.unref();
   }
 
-  connect(request, response) {
+  connect(request, response, filter = () => true) {
     response.writeHead(200, {
       connection: "keep-alive",
       "cache-control": "no-cache, no-transform",
@@ -944,8 +1180,12 @@ class EventHub {
       "x-accel-buffering": "no",
     });
     response.write(": connected\n\n");
-    this.clients.add(response);
-    request.once("close", () => this.clients.delete(response));
+    this.clients.add({ response, filter });
+    request.once("close", () => {
+      for (const client of this.clients) {
+        if (client.response === response) this.clients.delete(client);
+      }
+    });
   }
 
   emit(type, value) {
@@ -956,13 +1196,16 @@ class EventHub {
       ...value,
       at: new Date().toISOString(),
     };
+    this.onEmit?.(event);
     const message = `event: ${type}\ndata: ${JSON.stringify(event)}\n\n`;
-    for (const response of this.clients) response.write(message);
+    for (const client of this.clients) {
+      if (client.filter(event)) client.response.write(message);
+    }
   }
 
   close() {
     clearInterval(this.keepAlive);
-    for (const response of this.clients) response.end();
+    for (const client of this.clients) client.response.end();
     this.clients.clear();
   }
 }
@@ -1308,7 +1551,17 @@ export function resolveHost(value = process.env.CODEX_TASKBOARD_HOST ?? "0.0.0.0
 export function createTaskboardServer(options = {}) {
   const resolved = resolveServerOptions(options);
   const database = new TaskboardDatabase(resolved.databasePath);
-  const events = new EventHub();
+  const wecomAuth = createWeComAuth({
+    database,
+    config: resolveWeComConfig(options.wecom),
+    fetch: options.wecomFetch ?? globalThis.fetch,
+  });
+  const events = new EventHub((event) => database.appendIntegrationEvent("workbuddy", event));
+  const deviceProjectSync = createDeviceProjectSync({
+    database,
+    config: resolveDeviceProjectSyncConfig(options.deviceProjectSync),
+    onChange: (devices) => events.emit("device.projects.synced", { devices }),
+  });
   const cloudConfig = options.cloudConfigStore ?? createCloudConfigStore({
     configPath: resolved.cloudConfigPath,
   });
@@ -1338,9 +1591,13 @@ export function createTaskboardServer(options = {}) {
     response.setHeader("x-content-type-options", "nosniff");
     response.setHeader("referrer-policy", "no-referrer");
     try {
-      assertTrustedNetworkRequest(request);
+      assertTrustedNetworkRequest(request, wecomAuth.trustedOrigin);
       const url = new URL(request.url, "http://127.0.0.1");
-      const pathname = url.pathname;
+      const wecomRoute = await wecomAuth.handle(request, response, url);
+      if (wecomRoute.handled) return;
+      const pathname = wecomRoute.pathname;
+      request.taskboardActor = wecomAuth.actorFromRequest(request);
+      request.taskboardRole = wecomAuth.roleFromRequest(request, request.taskboardActor);
       const isLocalAiRoute = pathname === "/api/local/ai" || pathname.startsWith("/api/local/ai/");
       if (isLocalAiRoute) {
         assertAiLoopbackRequest(request);
@@ -1359,6 +1616,568 @@ export function createTaskboardServer(options = {}) {
       if (pathname === "/health") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         return sendJson(response, 200, { status: "ok" });
+      }
+
+      if (pathname === "/api/session") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/session");
+        const actor = request.taskboardActor ?? {
+          type: "user",
+          id: "local-user",
+          name: "本地用户",
+          avatarUrl: null,
+        };
+        return sendJson(response, 200, {
+          mode: request.taskboardActor?.id?.startsWith("basic:") ? "service"
+            : request.taskboardActor ? "wecom" : "local",
+          agentId: request.taskboardActor?.id?.startsWith("basic:")
+            ? null
+            : request.taskboardActor ? wecomAuth.config.agentId : null,
+          role: request.taskboardRole,
+          user: actor,
+        });
+      }
+
+      if (pathname === "/api/integrations/workbuddy/changes") {
+        assertWorkBuddyBridge(request);
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertAllowedQuery(url.searchParams, new Set(["after", "limit"]), "GET WorkBuddy changes");
+        const after = Number(url.searchParams.get("after") ?? "0");
+        const limit = Number(url.searchParams.get("limit") ?? "100");
+        if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+          throw new ApiError(400, "INVALID_QUERY", "'after' and 'limit' must be bounded integers");
+        }
+        const changes = database.listIntegrationEvents("workbuddy", after, limit);
+        return sendJson(response, 200, {
+          changes,
+          nextCursor: changes.at(-1)?.sequence ?? after,
+        });
+      }
+
+      if (pathname === "/mcp/workbuddy") {
+        assertAgentActor(request);
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /mcp/workbuddy");
+        const message = await readJson(request);
+        assertPlainObject(message);
+        const id = message.id ?? null;
+        if (message.method === "notifications/initialized") return sendEmpty(response, 202);
+        if (message.method === "initialize") {
+          return sendJson(response, 200, {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              protocolVersion: "2025-03-26",
+              capabilities: { tools: { listChanged: false } },
+              serverInfo: { name: "dashi-taskboard-workbuddy", version: "0.1.0" },
+            },
+          });
+        }
+        if (message.method === "tools/list") {
+          return sendJson(response, 200, {
+            jsonrpc: "2.0",
+            id,
+            result: { tools: [
+              {
+                name: "dashi_project_changes",
+                description: "读取 Dashi 项目的增量任务、评论和审批事件，并返回下一游标。",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    after: { type: "integer", minimum: 0, default: 0 },
+                    limit: { type: "integer", minimum: 1, maximum: 200, default: 100 },
+                  },
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_get_task",
+                description: "按 Dashi task ID 读取任务、关系和最近审批记录。",
+                inputSchema: {
+                  type: "object",
+                  properties: { taskId: { type: "string" } },
+                  required: ["taskId"],
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_add_comment",
+                description: "把 WorkBuddy 员工或 Agent 的进度摘要写入 Dashi 任务评论。",
+                inputSchema: {
+                  type: "object",
+                  properties: { taskId: { type: "string" }, body: { type: "string", maxLength: 100000 } },
+                  required: ["taskId", "body"],
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_list_project_messages",
+                description: "读取项目共享群聊中的员工消息、Agent 回复和执行进度。",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    projectId: { type: "string", maxLength: 64 },
+                    after: { type: "integer", minimum: 0, default: 0 },
+                    limit: { type: "integer", minimum: 1, maximum: 200, default: 100 },
+                  },
+                  required: ["projectId"],
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_post_project_message",
+                description: "把 WorkBuddy 或 Agent 的回复和进度写回项目共享群聊。",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    projectId: { type: "string", maxLength: 64 },
+                    body: { type: "string", maxLength: 100000 },
+                    kind: { type: "string", enum: ["message", "progress", "decision"] },
+                    taskId: { type: "string", maxLength: 128 },
+                    replyToMessageId: { type: "string", maxLength: 128 },
+                    mentions: { type: "array", items: { type: "string", maxLength: 96 }, maxItems: 20 },
+                    authorUserId: { type: "string", maxLength: 96 },
+                    authorName: { type: "string", maxLength: 120 },
+                  },
+                  required: ["projectId", "body"],
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_submit_for_review",
+                description: "将任务提交到审核中；不能直接标记完成。",
+                inputSchema: {
+                  type: "object",
+                  properties: { taskId: { type: "string" }, version: { type: "integer", minimum: 1 } },
+                  required: ["taskId", "version"],
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_upsert_project",
+                description: "把 WorkBuddy 项目登记到 Dashi（幂等：已存在则直接返回）。返回 Dashi 项目 ID，供后续 upsert_task 使用。",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    workbuddyProjectId: { type: "string", maxLength: 190 },
+                    name: { type: "string", maxLength: 160 },
+                    ownerUserId: { type: "string", maxLength: 190 },
+                    ownerName: { type: "string", maxLength: 190 },
+                  },
+                  required: ["workbuddyProjectId", "name"],
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_upsert_task",
+                description: "把 WorkBuddy 项目的任务同步到 Dashi（幂等：按 workbuddyTaskId 去重，已存在则更新标题/描述/状态）。WorkBuddy 侧 done 映射为 in_review 待管理员审批。",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    projectId: { type: "string", maxLength: 64 },
+                    workbuddyTaskId: { type: "string", maxLength: 190 },
+                    title: { type: "string", maxLength: 200 },
+                    description: { type: "string", maxLength: 100000 },
+                    status: { type: "string", enum: ["todo", "in_progress", "in_review", "done"] },
+                    assigneeName: { type: "string", maxLength: 190 },
+                  },
+                  required: ["projectId", "workbuddyTaskId", "title"],
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_agent_register",
+                description: "Agent 接入注册（任意终端的 Claude/Codex/DeepSeek 等 Worker 调用）。注册后以「名称·设备」身份出现在项目群聊。agentId 默认取认证用户名。",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    agentId: { type: "string", maxLength: 96 },
+                    name: { type: "string", maxLength: 120 },
+                    device: { type: "string", maxLength: 120 },
+                    capabilities: { type: "array", items: { type: "string", maxLength: 40 }, maxItems: 16 },
+                    projects: { type: "array", items: { type: "string", maxLength: 64 }, maxItems: 64 },
+                    concurrency: { type: "integer", minimum: 1, maximum: 16 },
+                  },
+                  required: ["name"],
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_agent_heartbeat",
+                description: "Agent 心跳：保持在线状态。超过 5 分钟无心跳将被标记离线，其任务租约到期后可被其他 Agent 接管。",
+                inputSchema: { type: "object", properties: {}, additionalProperties: false },
+              },
+              {
+                name: "dashi_list_agents",
+                description: "列出所有已注册 Agent：身份、设备、能力、在线状态、当前持有租约。",
+                inputSchema: { type: "object", properties: {}, additionalProperties: false },
+              },
+              {
+                name: "dashi_agent_events",
+                description: "Agent 拉取派发事件（增量）：群聊中 @本Agent 或 @Agent(任意) 的工作请求。用返回的 nextCursor 轮询。",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    after: { type: "integer", minimum: 0, default: 0 },
+                    limit: { type: "integer", minimum: 1, maximum: 200, default: 100 },
+                  },
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_claim_task",
+                description: "原子领取任务并获得租约：并发时只有一个 Agent 成功；任务被其他有效租约持有返回 409。领取成功会向项目群聊写进度消息。",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    taskId: { type: "string", maxLength: 128 },
+                    leaseSeconds: { type: "integer", minimum: 30, maximum: 86400 },
+                  },
+                  required: ["taskId"],
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_renew_task_lease",
+                description: "续租当前持有的任务租约，长任务需要周期性调用。",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    taskId: { type: "string", maxLength: 128 },
+                    leaseSeconds: { type: "integer", minimum: 30, maximum: 86400 },
+                  },
+                  required: ["taskId"],
+                  additionalProperties: false,
+                },
+              },
+              {
+                name: "dashi_release_task",
+                description: "释放任务租约（放弃/交接时调用），任务回到可领取状态并记录到群聊。",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    taskId: { type: "string", maxLength: 128 },
+                    reason: { type: "string", maxLength: 500 },
+                  },
+                  required: ["taskId"],
+                  additionalProperties: false,
+                },
+              },
+            ] },
+          });
+        }
+        if (message.method === "tools/call") {
+          const toolName = message.params?.name;
+          const args = message.params?.arguments ?? {};
+          let result;
+          if (toolName === "dashi_project_changes") {
+            const after = Number(args.after ?? 0);
+            const limit = Number(args.limit ?? 100);
+            if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+              throw new ApiError(400, "INVALID_FIELD", "Invalid WorkBuddy change cursor or limit");
+            }
+            const changes = database.listIntegrationEvents("workbuddy", after, limit);
+            result = { changes, nextCursor: changes.at(-1)?.sequence ?? after };
+          } else if (toolName === "dashi_get_task") {
+            const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
+            const task = database.getTask(taskId);
+            if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+            result = { task };
+          } else if (toolName === "dashi_add_comment") {
+            const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
+            const body = stringField(args.body, "body", { required: true, maxLength: 100_000 });
+            const comment = database.createComment(taskId, {
+              body,
+              actor: resolveAgentAuthor(database, actorFromRequest(request)),
+            });
+            const task = database.getTask(taskId);
+            events.emit("comment.created", { comment, task });
+            result = { comment, task };
+          } else if (toolName === "dashi_list_project_messages") {
+            const projectId = stringField(args.projectId, "projectId", { required: true, maxLength: 64 });
+            validateProjectId(projectId);
+            const after = Number(args.after ?? 0);
+            const limit = Number(args.limit ?? 100);
+            if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+              throw new ApiError(400, "INVALID_FIELD", "Invalid project message cursor or limit");
+            }
+            const messages = database.listProjectMessages(projectId, after, limit);
+            result = { messages, nextCursor: messages.at(-1)?.sequence ?? after };
+          } else if (toolName === "dashi_post_project_message") {
+            const projectId = stringField(args.projectId, "projectId", { required: true, maxLength: 64 });
+            validateProjectId(projectId);
+            const input = parseProjectMessage({
+              body: args.body,
+              kind: args.kind,
+              mentions: args.mentions,
+              taskId: args.taskId,
+              replyToMessageId: args.replyToMessageId,
+            });
+            const authorUserId = isWorkBuddyBridge(request)
+              ? stringField(args.authorUserId, "authorUserId", { required: false, maxLength: 96 })
+              : undefined;
+            const authorName = stringField(
+              args.authorName,
+              "authorName",
+              { required: false, maxLength: 120 },
+            );
+            if ((authorUserId === undefined) !== (authorName === undefined)) {
+              throw new ApiError(400, "INVALID_FIELD", "authorUserId and authorName must be provided together");
+            }
+            if (!isWorkBuddyBridge(request) && args.authorUserId !== undefined) {
+              throw new ApiError(403, "WORKBUDDY_BRIDGE_REQUIRED", "Only the WorkBuddy bridge may post on behalf of users");
+            }
+            if (authorUserId && !database.getProjectMembership(projectId, authorUserId)) {
+              throw new ApiError(403, "PROJECT_ACCESS_DENIED", "WorkBuddy 发言人不是此项目成员");
+            }
+            const projectMessage = database.createProjectMessage(projectId, {
+              ...input,
+              actor: authorUserId
+                ? { type: "user", id: authorUserId, name: authorName, avatarUrl: null }
+                : resolveAgentAuthor(database, actorFromRequest(request)),
+            });
+            events.emit("project.message.created", { projectId, message: projectMessage });
+            dispatchAgentMentions(database, events, projectId, projectMessage);
+            result = { message: projectMessage };
+          } else if (toolName === "dashi_submit_for_review") {
+            const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
+            const username = agentUsernameFromActor(actorFromRequest(request));
+            if (!username || username === "workbuddy-agent") {
+              throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Only the Agent holding the active lease may submit for review");
+            }
+            const task = database.submitClaimedTaskForReview(taskId, username, parseVersion(args.version));
+            events.emit("task.moved", { task });
+            result = { task };
+          } else if (toolName === "dashi_upsert_project") {
+            assertWorkBuddyBridge(request);
+            const workbuddyProjectId = stringField(args.workbuddyProjectId, "workbuddyProjectId", { required: true, maxLength: 190 });
+            const name = stringField(args.name, "name", { required: true, maxLength: 160 });
+            const ownerUserId = stringField(args.ownerUserId, "ownerUserId", { required: false, maxLength: 190 }) ?? null;
+            const ownerName = stringField(args.ownerName, "ownerName", { required: false, maxLength: 190 }) ?? null;
+            const projectId = workbuddyProjectMappingId(workbuddyProjectId);
+            let project = database.getProject(projectId);
+            let created = false;
+            if (!project) {
+              project = database.createProject({ id: projectId, name, workspacePath: null, actor: actorFromRequest(request) });
+              created = true;
+            }
+            if (ownerUserId) {
+              database.upsertProjectMember(projectId, {
+                userId: ownerUserId.slice(0, 96),
+                userName: (ownerName ?? ownerUserId).slice(0, 120),
+                userAvatarUrl: null,
+                role: "manager",
+              });
+              project = database.getProject(projectId);
+            }
+            events.emit("project.member.updated", { projectId, project });
+            result = { project, created };
+          } else if (toolName === "dashi_upsert_task") {
+            assertWorkBuddyBridge(request);
+            const projectId = stringField(args.projectId, "projectId", { required: true, maxLength: 64 });
+            validateProjectId(projectId);
+            const workbuddyTaskId = stringField(args.workbuddyTaskId, "workbuddyTaskId", { required: true, maxLength: 190 });
+            const title = stringField(args.title, "title", { required: true, maxLength: 200 });
+            const description = stringField(args.description, "description", { required: false, maxLength: 100_000 }) ?? null;
+            const rawStatus = stringField(args.status, "status", { required: false, maxLength: 32 });
+            const assigneeName = stringField(args.assigneeName, "assigneeName", { required: false, maxLength: 190 }) ?? null;
+            if (rawStatus !== undefined && !isTaskStatus(rawStatus)) {
+              throw new ApiError(400, "INVALID_FIELD", "status must be one of todo/in_progress/in_review/done");
+            }
+            // WorkBuddy completion requires administrator review in Dashi.
+            const status = rawStatus === "done" ? "in_review" : rawStatus;
+            const threadId = `workbuddy:${workbuddyTaskId}`;
+            const actor = actorFromRequest(request);
+            const existingId = database.findTaskIdByThreadId(threadId);
+            let task;
+            if (existingId) {
+              const current = database.getTask(existingId);
+              const changes = {};
+              if (title !== current.title) changes.title = title;
+              if (description !== null && description !== current.description) changes.description = description;
+              if (status !== undefined && status !== current.status) changes.status = status;
+              if (Object.keys(changes).length > 0) {
+                task = database.updateTask(existingId, current.version, changes, undefined);
+                events.emit("task.updated", { task });
+              } else {
+                task = current;
+              }
+              result = { task, created: false };
+            } else {
+              task = database.createTask({
+                projectId,
+                title,
+                description: description ?? "",
+                status: status ?? "todo",
+                priority: "medium",
+                labels: ["workbuddy"],
+                threadId,
+                workflowId: null,
+                developmentContext: null,
+                dueDate: null,
+                recurrence: null,
+                actor,
+                assignee: assigneeName
+                  ? { type: "user", id: `workbuddy:${assigneeName}`, name: assigneeName, avatarUrl: null }
+                  : actor,
+              });
+              events.emit("task.created", { task });
+              result = { task, created: true };
+            }
+          } else if (toolName === "dashi_agent_register") {
+            const actor = actorFromRequest(request);
+            const username = agentUsernameFromActor(actor);
+            const explicitId = stringField(args.agentId, "agentId", { required: false, maxLength: 96 });
+            if (!explicitId && !username) {
+              throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Agent tools require agent (Basic + x-taskboard-client) authentication");
+            }
+            if (explicitId && username && username !== "workbuddy-agent" && explicitId !== username) {
+              throw new ApiError(403, "AGENT_ID_MISMATCH", `Authenticated as '${username}'; cannot register as '${explicitId}'`);
+            }
+            const capabilities = Array.isArray(args.capabilities)
+              ? args.capabilities.map((item, index) => stringField(item, `capabilities[${index}]`, { required: true, maxLength: 40 }))
+              : [];
+            const projects = Array.isArray(args.projects)
+              ? args.projects.map((item, index) => validateProjectId(
+                stringField(item, `projects[${index}]`, { required: true, maxLength: 64 }),
+              ))
+              : [];
+            const concurrency = Number(args.concurrency ?? 1);
+            if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 16) {
+              throw new ApiError(400, "INVALID_FIELD", "'concurrency' must be an integer between 1 and 16");
+            }
+            const agent = database.upsertAgent({
+              id: explicitId ?? username,
+              name: stringField(args.name, "name", { required: true, maxLength: 120 }),
+              device: stringField(args.device ?? "", "device", { required: false, maxLength: 120 }) ?? "",
+              capabilities,
+              projects,
+              concurrency,
+            });
+            events.emit("agent.registered", { agent });
+            result = { agent };
+          } else if (toolName === "dashi_agent_heartbeat") {
+            const username = agentUsernameFromActor(actorFromRequest(request));
+            if (!username) throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Agent tools require agent authentication");
+            const agent = database.heartbeatAgent(username);
+            if (!agent) throw new ApiError(404, "AGENT_NOT_FOUND", `Agent '${username}' is not registered; call dashi_agent_register first`);
+            result = { agent };
+          } else if (toolName === "dashi_list_agents") {
+            result = { agents: database.listAgents() };
+          } else if (toolName === "dashi_agent_events") {
+            const after = Number(args.after ?? 0);
+            const limit = Number(args.limit ?? 100);
+            if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+              throw new ApiError(400, "INVALID_FIELD", "Invalid agent event cursor or limit");
+            }
+            const username = agentUsernameFromActor(actorFromRequest(request));
+            const registeredAgent = username ? database.getAgent(username) : null;
+            const allEvents = database.listIntegrationEvents("agents", after, limit);
+            const eventsForAgent = username && username !== "workbuddy-agent"
+              ? allEvents.filter((event) => (
+                (
+                  registeredAgent?.projects?.length === 0
+                  || registeredAgent?.projects?.includes(event.projectId)
+                )
+                && (
+                  event.eventType !== "agent.dispatch"
+                  || event.payload.anyAgent
+                  || event.payload.targets?.some((target) => target.id === username)
+                )
+              ))
+              : allEvents;
+            result = {
+              events: eventsForAgent,
+              nextCursor: allEvents.at(-1)?.sequence ?? after,
+            };
+          } else if (toolName === "dashi_claim_task") {
+            const username = agentUsernameFromActor(actorFromRequest(request));
+            if (!username) throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Agent tools require agent authentication");
+            const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
+            const leaseSeconds = boundedLeaseSeconds(args.leaseSeconds);
+            const claim = database.claimTask(taskId, username, leaseSeconds);
+            const agent = database.getAgent(username);
+            const agentLabel = agent.device ? `${agent.name}·${agent.device}` : agent.name;
+            if (!claim.replayed) {
+              agentSystemMessage(
+                database,
+                events,
+                claim.task.projectId,
+                claim.tookOver
+                  ? `【接管】${agentLabel} 接管任务「${claim.task.title}」（原执行者 ${claim.previousAgentId} 租约已超时）`
+                  : `【领取】${agentLabel} 领取任务「${claim.task.title}」，租约至 ${claim.lease.expiresAt}`,
+                taskId,
+              );
+              events.emit("task.claimed", { task: claim.task, lease: claim.lease, agentId: username });
+              database.appendIntegrationEvent("workbuddy", {
+                type: "task.claimed",
+                projectId: claim.task.projectId,
+                taskId,
+                agent: { id: username, name: agent.name, device: agent.device },
+                tookOver: claim.tookOver,
+              });
+            }
+            result = claim;
+          } else if (toolName === "dashi_renew_task_lease") {
+            const username = agentUsernameFromActor(actorFromRequest(request));
+            if (!username) throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Agent tools require agent authentication");
+            const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
+            const leaseSeconds = boundedLeaseSeconds(args.leaseSeconds);
+            const lease = database.renewTaskLease(taskId, username, leaseSeconds);
+            events.emit("task.lease.renewed", { taskId, lease });
+            result = { lease };
+          } else if (toolName === "dashi_release_task") {
+            const username = agentUsernameFromActor(actorFromRequest(request));
+            if (!username) throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Agent tools require agent authentication");
+            const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
+            const reason = stringField(args.reason ?? "", "reason", { required: false, maxLength: 500 }) ?? "";
+            const task = database.releaseTask(taskId, username, { returnToStatus: "todo" });
+            const agent = database.getAgent(username);
+            if (task) {
+              const agentLabel = agent ? (agent.device ? `${agent.name}·${agent.device}` : agent.name) : username;
+              agentSystemMessage(
+                database,
+                events,
+                task.projectId,
+                `【释放】${agentLabel} 释放任务「${task.title}」${reason ? `：${reason}` : ""}，任务回到可领取状态`,
+                taskId,
+              );
+            }
+            events.emit("task.released", { task, agentId: username });
+            result = { task };
+          } else {
+            return sendJson(response, 200, {
+              jsonrpc: "2.0",
+              id,
+              result: workBuddyToolResult(`Unknown tool '${toolName}'`, true),
+            });
+          }
+          return sendJson(response, 200, { jsonrpc: "2.0", id, result: workBuddyToolResult(result) });
+        }
+        return sendJson(response, 200, {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: "Method not found" },
+        });
+      }
+
+      if (pathname === "/api/agents") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/agents");
+        return sendJson(response, 200, { agents: database.listAgents() });
+      }
+
+      if (pathname === "/api/devices") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/devices");
+        return sendJson(response, 200, { devices: database.listDevices() });
+      }
+
+      if (pathname === "/api/devices/refresh") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/devices/refresh");
+        await assertEmptyRequestBody(request, "POST /api/devices/refresh");
+        return sendJson(response, 200, { devices: await deviceProjectSync.refreshAll() });
       }
 
       if (pathname === "/api/local/cloud-session") {
@@ -1580,25 +2399,146 @@ export function createTaskboardServer(options = {}) {
           if (!isLocalCompanionRoute(pathname)) {
             return sendFetchResponse(
               response,
-              await cloudProxy.forward(toFetchRequest(request)),
+              await cloudProxy.forward(toFetchRequest(request, `${pathname}${url.search}`)),
             );
           }
         }
       }
 
+      if (request.taskboardRole !== "admin") {
+        const projectScoped = pathname.match(/^\/api\/projects\/([^/]+)(?:\/|$)/);
+        if (projectScoped) {
+          assertProjectAccess(request, database, decodeURIComponent(projectScoped[1]));
+        }
+        const taskScoped = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/|$)/);
+        if (taskScoped) {
+          const task = database.getTask(decodeURIComponent(taskScoped[1]));
+          if (!task) throw new ApiError(404, "TASK_NOT_FOUND", "Task does not exist");
+          assertProjectAccess(request, database, task.projectId);
+        }
+        const commentScoped = pathname.match(/^\/api\/comments\/([^/]+)(?:\/|$)/);
+        if (commentScoped) {
+          const comment = database.getComment(decodeURIComponent(commentScoped[1]));
+          if (!comment) throw new ApiError(404, "COMMENT_NOT_FOUND", "Comment does not exist");
+          const task = database.getTask(comment.taskId);
+          assertProjectAccess(request, database, task.projectId);
+        }
+        const attachmentScoped = pathname.match(/^\/api\/attachments\/([^/]+)(?:\/|$)/);
+        if (attachmentScoped) {
+          const attachment = database.getAttachment(decodeURIComponent(attachmentScoped[1]));
+          if (!attachment) throw new ApiError(404, "ATTACHMENT_NOT_FOUND", "Attachment does not exist");
+          const task = database.getTask(attachment.taskId);
+          assertProjectAccess(request, database, task.projectId);
+        }
+      }
+
       if (pathname === "/api/projects") {
         if (request.method === "GET") {
-          if ([...url.searchParams.keys()].length > 0) {
-            throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/projects does not accept query parameters");
-          }
-          return sendJson(response, 200, { projects: database.listProjects() });
+          const { hidden } = parseProjectFilters(url.searchParams);
+          const projects = database.listProjects(hidden).filter((project) => (
+            canAccessProject(request, database, project.id)
+          ));
+          return sendJson(response, 200, { projects });
         }
         if (request.method === "POST") {
-          const project = database.createProject(parseProjectCreate(await readJson(request)));
+          assertAdmin(request);
+          const project = database.createProject({
+            ...parseProjectCreate(await readJson(request)),
+            actor: actorFromRequest(request),
+          });
           events.emit("project.created", { project });
           return sendJson(response, 201, { project });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const projectMembersRoute = pathname.match(/^\/api\/projects\/([^/]+)\/members(?:\/([^/]+))?$/);
+      if (projectMembersRoute) {
+        let projectId;
+        let userId = null;
+        try {
+          projectId = decodeURIComponent(projectMembersRoute[1]);
+          userId = projectMembersRoute[2] ? decodeURIComponent(projectMembersRoute[2]) : null;
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project member path contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Project member routes do not accept query parameters");
+        }
+        if (!userId && request.method === "GET") {
+          return sendJson(response, 200, { members: database.listProjectMembers(projectId) });
+        }
+        assertProjectAdmin(request, database, projectId);
+        if (!userId && request.method === "POST") {
+          const member = database.upsertProjectMember(projectId, parseProjectMember(await readJson(request)));
+          events.emit("project.member.updated", { projectId, member });
+          return sendJson(response, 200, { member });
+        }
+        if (userId && request.method === "DELETE") {
+          const member = database.removeProjectMember(projectId, userId);
+          events.emit("project.member.removed", { projectId, member });
+          return sendEmpty(response, 204);
+        }
+        return methodNotAllowed(response, userId ? ["DELETE"] : ["GET", "POST"]);
+      }
+
+      const projectMessagesRoute = pathname.match(/^\/api\/projects\/([^/]+)\/messages$/);
+      if (projectMessagesRoute) {
+        let projectId;
+        try {
+          projectId = decodeURIComponent(projectMessagesRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project message path contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        assertProjectAccess(request, database, projectId);
+        if (request.method === "GET") {
+          assertAllowedQuery(url.searchParams, new Set(["after", "limit"]), "GET project messages");
+          const after = Number(url.searchParams.get("after") ?? "0");
+          const limit = Number(url.searchParams.get("limit") ?? "100");
+          if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+            throw new ApiError(400, "INVALID_QUERY", "'after' and 'limit' must be bounded integers");
+          }
+          const messages = database.listProjectMessages(projectId, after, limit);
+          return sendJson(response, 200, {
+            messages,
+            nextCursor: messages.at(-1)?.sequence ?? after,
+          });
+        }
+        if (request.method === "POST") {
+          assertNoQuery(url.searchParams, "POST project message");
+          const input = parseProjectMessage(await readJson(request));
+          const message = database.createProjectMessage(projectId, {
+            ...input,
+            actor: resolveAgentAuthor(database, actorFromRequest(request)),
+          });
+          events.emit("project.message.created", { projectId, message });
+          dispatchAgentMentions(database, events, projectId, message);
+          return sendJson(response, 201, { message });
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const projectVisibilityRoute = pathname.match(/^\/api\/projects\/([^/]+)\/(hide|restore)$/);
+      if (projectVisibilityRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Project visibility routes do not accept query parameters");
+        }
+        let projectId;
+        try {
+          projectId = decodeURIComponent(projectVisibilityRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        const { version } = parseArchive(await readJson(request));
+        const project = projectVisibilityRoute[2] === "hide"
+          ? database.hideProject(projectId, version)
+          : database.restoreProject(projectId, version);
+        events.emit(projectVisibilityRoute[2] === "hide" ? "project.hidden" : "project.restored", { project });
+        return sendJson(response, 200, { project });
       }
 
       const workflowWorkspaceRoute = pathname.match(/^\/api\/projects\/([^/]+)\/workflow-workspace$/);
@@ -1679,11 +2619,18 @@ export function createTaskboardServer(options = {}) {
 
       if (pathname === "/api/tasks") {
         if (request.method === "GET") {
-          return sendJson(response, 200, { tasks: database.listTasks(parseTaskFilters(url.searchParams)) });
+          const filters = parseTaskFilters(url.searchParams);
+          if (filters.projectId) assertProjectAccess(request, database, filters.projectId);
+          const tasks = database.listTasks(filters).filter((task) => (
+            canAccessProject(request, database, task.projectId)
+          ));
+          return sendJson(response, 200, { tasks });
         }
         if (request.method === "POST") {
           const actor = actorFromRequest(request);
           const { assigneeTarget, ...input } = parseTaskCreate(await readJson(request));
+          assertProjectAccess(request, database, input.projectId);
+          if (input.status === "done") assertProjectAdmin(request, database, input.projectId);
           const task = database.createTask({
             ...input,
             actor,
@@ -1700,7 +2647,10 @@ export function createTaskboardServer(options = {}) {
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/events does not accept query parameters");
         }
-        events.connect(request, response);
+        events.connect(request, response, (event) => (
+          request.taskboardRole === "admin"
+          || Boolean(event.projectId && canAccessProject(request, database, event.projectId))
+        ));
         return;
       }
 
@@ -1966,7 +2916,7 @@ export function createTaskboardServer(options = {}) {
         return sendEmpty(response, 204);
       }
 
-      const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);
+      const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move|review))?$/);
       if (taskRoute) {
         let id;
         try {
@@ -1988,6 +2938,9 @@ export function createTaskboardServer(options = {}) {
         }
         if (!action && request.method === "PATCH") {
           const { version, changes, threadId, assigneeTarget } = parseTaskPatch(await readJson(request));
+          const currentTask = database.getTask(id);
+          if (!currentTask) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (changes.status === "done") assertProjectAdmin(request, database, currentTask.projectId);
           if (assigneeTarget !== undefined) {
             changes.assignee = resolveAssignee(assigneeTarget, actorFromRequest(request));
           }
@@ -1997,8 +2950,30 @@ export function createTaskboardServer(options = {}) {
         }
         if (action === "move" && request.method === "POST") {
           const move = parseMove(await readJson(request));
+          const currentTask = database.getTask(id);
+          if (!currentTask) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (move.status === "done") assertProjectAdmin(request, database, currentTask.projectId);
           const task = database.moveTask(id, move.version, move.status, move.sortOrder, move.threadId);
           events.emit("task.moved", { task });
+          return sendJson(response, 200, { task });
+        }
+        if (action === "review" && request.method === "POST") {
+          const reviewTarget = database.getTask(id);
+          if (!reviewTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          assertProjectAdmin(request, database, reviewTarget.projectId);
+          const body = await readJson(request);
+          const version = parseVersion(body.version);
+          const decision = body.decision === "approve" ? "approved"
+            : body.decision === "request_changes" ? "changes_requested"
+              : null;
+          if (!decision) {
+            throw new ApiError(400, "INVALID_FIELD", "'decision' must be approve or request_changes");
+          }
+          const note = body.note === undefined || body.note === null || body.note === ""
+            ? null
+            : stringField(body.note, "note", { required: true, maxLength: 4000 });
+          const task = database.reviewTask(id, version, decision, note, actorFromRequest(request));
+          events.emit("task.reviewed", { task, review: task.latestReview });
           return sendJson(response, 200, { task });
         }
         if (action === "archive" && request.method === "POST") {
@@ -2053,6 +3028,8 @@ export function createTaskboardServer(options = {}) {
       if (host !== "127.0.0.1" && host !== "0.0.0.0") {
         throw new Error("Taskboard server must bind to 127.0.0.1 or 0.0.0.0");
       }
+      await deviceProjectSync.refreshAll();
+      deviceProjectSync.start();
       await new Promise((resolve, reject) => {
         const onError = (error) => {
           server.off("listening", onListening);
@@ -2076,9 +3053,11 @@ export function createTaskboardServer(options = {}) {
           })
         : Promise.resolve();
       events.close();
+      deviceProjectSync.close();
       for (const response of aiEventResponses) response.end();
       aiEventResponses.clear();
       await aiChat.close();
+      await wecomAuth.close();
       await serverClosed;
       listening = false;
       database.close();

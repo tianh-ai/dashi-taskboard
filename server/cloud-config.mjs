@@ -35,16 +35,15 @@ export function normalizeCloudUrl(value) {
     (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback))
     || url.username
     || url.password
-    || url.pathname !== "/"
     || url.search
     || url.hash
   ) {
     throw new CloudConfigError(
       "INVALID_CLOUD_URL",
-      "Cloud taskboard URL must be an HTTPS origin (loopback HTTP is allowed for development)",
+      "Cloud taskboard URL must be HTTPS (loopback HTTP is allowed for development)",
     );
   }
-  return url.origin;
+  return `${url.origin}${url.pathname.replace(/\/$/, "")}`;
 }
 
 function validateCredentials(actorName, sharedKey) {

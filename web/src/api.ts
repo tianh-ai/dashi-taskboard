@@ -9,8 +9,13 @@ import type {
   Attachment,
   Comment,
   DevelopmentScan,
+  Device,
+  AgentStatus,
   IssueRelationType,
   Project,
+  ProjectMessage,
+  ProjectMember,
+  SessionRole,
   Task,
   TaskboardMetadata,
   TaskDraft,
@@ -28,8 +33,25 @@ const DEFAULT_USER_ACTOR: ActorIdentity = {
 
 let currentUserActor = DEFAULT_USER_ACTOR;
 
+const TASKBOARD_BASE_PATH = typeof window === "undefined"
+  ? ""
+  : window.location.pathname.match(/^\/wecom\/app\/[^/]+\/taskboard/)?.[0] ?? "";
+
+export function taskboardUrl(path: string) {
+  return `${TASKBOARD_BASE_PATH}${path}`;
+}
+
 export function setCurrentUserActor(actor?: ActorIdentity) {
   currentUserActor = actor?.type === "user" ? actor : DEFAULT_USER_ACTOR;
+}
+
+export async function getCurrentSession(signal?: AbortSignal): Promise<{
+  mode: "local" | "wecom";
+  agentId: string | null;
+  role: SessionRole;
+  user: ActorIdentity;
+}> {
+  return request("/api/session", { signal });
 }
 
 interface ApiErrorBody {
@@ -68,7 +90,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   let response: Response;
   try {
-    response = await fetch(path, { ...init, headers });
+    response = await fetch(taskboardUrl(path), { ...init, headers });
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") throw error;
     throw new ApiError(0, {
@@ -84,9 +106,105 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body;
 }
 
-export async function listProjects(signal?: AbortSignal): Promise<Project[]> {
-  const data = await request<{ projects: Project[] }>("/api/projects", { signal });
+export async function listProjects(signal?: AbortSignal, hidden: "false" | "true" | "all" = "false"): Promise<Project[]> {
+  const suffix = hidden === "false" ? "" : `?hidden=${hidden}`;
+  const data = await request<{ projects: Project[] }>(`/api/projects${suffix}`, { signal });
   return data.projects;
+}
+
+export async function hideProject(project: Project): Promise<Project> {
+  const data = await request<{ project: Project }>(`/api/projects/${encodeURIComponent(project.id)}/hide`, {
+    method: "POST",
+    body: JSON.stringify({ version: project.version }),
+  });
+  return data.project;
+}
+
+export async function restoreProject(project: Project): Promise<Project> {
+  const data = await request<{ project: Project }>(`/api/projects/${encodeURIComponent(project.id)}/restore`, {
+    method: "POST",
+    body: JSON.stringify({ version: project.version }),
+  });
+  return data.project;
+}
+
+export async function listProjectMembers(projectId: string, signal?: AbortSignal): Promise<ProjectMember[]> {
+  const data = await request<{ members: ProjectMember[] }>(
+    `/api/projects/${encodeURIComponent(projectId)}/members`,
+    { signal },
+  );
+  return data.members;
+}
+
+export async function saveProjectMember(
+  projectId: string,
+  input: Pick<ProjectMember, "userId" | "userName" | "role">,
+): Promise<ProjectMember> {
+  const data = await request<{ member: ProjectMember }>(
+    `/api/projects/${encodeURIComponent(projectId)}/members`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return data.member;
+}
+
+export async function removeProjectMember(projectId: string, userId: string): Promise<void> {
+  await request<void>(
+    `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function listProjectMessages(
+  projectId: string,
+  after = 0,
+  signal?: AbortSignal,
+): Promise<{ messages: ProjectMessage[]; nextCursor: number }> {
+  return request<{ messages: ProjectMessage[]; nextCursor: number }>(
+    `/api/projects/${encodeURIComponent(projectId)}/messages?after=${after}&limit=200`,
+    { signal },
+  );
+}
+
+export async function createProjectMessage(
+  projectId: string,
+  input: {
+    body: string;
+    kind?: ProjectMessage["kind"];
+    mentions?: string[];
+    taskId?: string | null;
+    replyToMessageId?: string | null;
+  },
+): Promise<ProjectMessage> {
+  const data = await request<{ message: ProjectMessage }>(
+    `/api/projects/${encodeURIComponent(projectId)}/messages`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return data.message;
+}
+
+export async function listDevices(signal?: AbortSignal): Promise<Device[]> {
+  const data = await request<{ devices: Device[] }>("/api/devices", { signal });
+  return data.devices;
+}
+
+export async function listAgents(signal?: AbortSignal): Promise<AgentStatus[]> {
+  const data = await request<{ agents: AgentStatus[] }>("/api/agents", { signal });
+  return data.agents;
+}
+
+export async function refreshDevices(): Promise<Array<{
+  deviceId: string;
+  status: "online" | "error";
+  projectCount: number;
+  error?: string;
+}>> {
+  const data = await request<{ devices: Array<{
+    deviceId: string;
+    status: "online" | "error";
+    projectCount: number;
+    error?: string;
+  }> }>("/api/devices/refresh", { method: "POST" });
+  return data.devices;
 }
 
 export async function getTaskboardMetadata(signal?: AbortSignal): Promise<TaskboardMetadata> {
@@ -199,7 +317,7 @@ export function subscribeAiChatThread(
   onHint: (type: "ai.event" | "ai.run") => void,
   onError?: () => void,
 ): () => void {
-  const source = new EventSource(`/api/local/ai/threads/${encodeURIComponent(threadId)}/events`);
+  const source = new EventSource(taskboardUrl(`/api/local/ai/threads/${encodeURIComponent(threadId)}/events`));
   source.addEventListener("ai.event", () => onHint("ai.event"));
   source.addEventListener("ai.run", () => onHint("ai.run"));
   if (onError) source.addEventListener("error", onError);
@@ -288,6 +406,11 @@ export async function listTasks(projectId: string, signal?: AbortSignal): Promis
   return data.tasks;
 }
 
+export async function listHiddenTasks(signal?: AbortSignal): Promise<Task[]> {
+  const data = await request<{ tasks: Task[] }>("/api/tasks?archived=true", { signal });
+  return data.tasks;
+}
+
 export async function createTask(projectId: string, draft: TaskDraft, threadId?: string): Promise<Task> {
   const data = await request<{ task: Task }>("/api/tasks", {
     method: "POST",
@@ -315,6 +438,21 @@ export async function moveTask(
     {
       method: "POST",
       body: JSON.stringify({ version: task.version, status, sortOrder, ...(threadId ? { threadId } : {}) }),
+    },
+  );
+  return data.task;
+}
+
+export async function reviewTask(
+  task: Task,
+  decision: "approve" | "request_changes",
+  note?: string,
+): Promise<Task> {
+  const data = await request<{ task: Task }>(
+    `/api/tasks/${encodeURIComponent(task.id)}/review`,
+    {
+      method: "POST",
+      body: JSON.stringify({ version: task.version, decision, note: note?.trim() || null }),
     },
   );
   return data.task;
@@ -454,5 +592,5 @@ export async function deleteAttachment(attachment: Attachment): Promise<void> {
 }
 
 export function attachmentContentUrl(attachment: Attachment): string {
-  return `/api/attachments/${encodeURIComponent(attachment.id)}/content`;
+  return taskboardUrl(`/api/attachments/${encodeURIComponent(attachment.id)}/content`);
 }

@@ -577,19 +577,41 @@ async function currentContext(api, options, overrides) {
   const response = await api.request("GET", "/api/projects");
   const projects = Array.isArray(response.projects) ? response.projects : [];
   const matchingProjects = projects
-    .filter((candidate) => workspaceContains(candidate?.workspacePath, cwd))
-    .sort((left, right) => right.workspacePath.length - left.workspacePath.length);
-  const project = matchingProjects[0]
+    .map((project) => ({ project, specificity: projectWorkspaceSpecificity(project, cwd) }))
+    .filter((candidate) => candidate.specificity >= 0)
+    .sort((left, right) => right.specificity - left.specificity);
+  const project = matchingProjects[0]?.project
     ?? projects.find((candidate) => candidate?.id === DEFAULT_PROJECT_ID)
     ?? projects[0]
     ?? null;
   return { cwd, project };
 }
 
+function projectWorkspaceSpecificity(project, cwd) {
+  const paths = [
+    project?.workspacePath,
+    ...(Array.isArray(project?.devices) ? project.devices.map((device) => device?.workspacePath) : []),
+  ];
+  return paths.reduce((specificity, workspacePath) => (
+    workspaceContains(workspacePath, cwd)
+      ? Math.max(specificity, canonicalPath(workspacePath).length)
+      : specificity
+  ), -1);
+}
+
 function workspaceContains(workspacePath, cwd) {
   if (typeof workspacePath !== "string" || workspacePath.length === 0) return false;
-  const relative = path.relative(path.resolve(workspacePath), cwd);
+  const relative = path.relative(canonicalPath(workspacePath), canonicalPath(cwd));
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function canonicalPath(value) {
+  const resolved = path.resolve(value);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
 }
 
 function resolveInputPath(value, overrides) {

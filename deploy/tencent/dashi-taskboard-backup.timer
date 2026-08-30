@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Dashi Taskboard backup
+
+[Timer]
+OnCalendar=*-*-* 03:10:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=300
+Unit=dashi-taskboard-backup.service
+
+[Install]
+WantedBy=timers.target

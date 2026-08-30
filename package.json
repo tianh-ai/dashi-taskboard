@@ -38,7 +38,8 @@
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "undici": "^7.28.0"
   },
   "devDependencies": {
     "@types/react": "^19.2.17",

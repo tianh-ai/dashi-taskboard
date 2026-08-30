@@ -20,9 +20,9 @@ test("the project home merges live Codex projects with persisted Taskboard proje
 
 test("each device stores an independent workspace path for every project", () => {
   assert.match(appSource, /const DEVICE_WORKSPACE_PATHS_KEY = "taskboard\.deviceWorkspacePaths\.v1"/);
-  assert.match(appSource, /function readDeviceWorkspacePaths\(\)/);
+  assert.match(appSource, /function readDeviceWorkspacePaths\(deviceId = ""\)/);
   assert.match(appSource, /rememberDeviceWorkspacePath/);
-  assert.match(appSource, /const \[nextProjects, metadata, workspaces\] = await Promise\.all\(\[/);
+  assert.match(appSource, /const \[nextProjects, nextHiddenProjects, nextDevices, metadata, workspaces\] = await Promise\.all\(\[/);
   assert.match(appSource, /listDeviceWorkspaces\(signal\)/);
   assert.match(appSource, /placeholder="设置此设备的项目目录"/);
   assert.match(appSource, /deviceWorkspacePaths\[selectedProjectId\]/);
@@ -52,7 +52,7 @@ test("the home uses the same restrained surface language as the issue board", ()
 
 test("new issues stage attachments in the composer and upload them after creation", () => {
   assert.match(editorSource, /type="file"[\s\S]*?multiple/);
-  assert.match(editorSource, /className="composer-attachment-list"/);
+  assert.match(editorSource, /<PendingAttachments/);
   assert.match(editorSource, /保存后上传/);
   assert.match(appSource, /Promise\.allSettled/);
   assert.match(appSource, /uploadAttachment\(saved\.id, file\)/);
@@ -110,7 +110,7 @@ test("the project home omits the navigation bar but keeps an invisible drag regi
 });
 
 test("realtime updates remain active on the project home and reconcile after reconnecting", () => {
-  assert.match(appSource, /useEffect\(\(\) => \{\s*const source = new EventSource\("\/api\/events"\)/);
+  assert.match(appSource, /useEffect\(\(\) => \{\s*const source = new EventSource\(taskboardUrl\("\/api\/events"\)\)/);
   assert.match(appSource, /event\.type\.startsWith\("task\."\)[\s\S]*?scheduleRefresh\(\{ projects: true, tasks: affectsSelectedProject \}\)/);
   assert.match(appSource, /source\.onopen = \(\) => \{[\s\S]*?scheduleRefresh\(\{ projects: true, tasks: Boolean\(selectedProjectId\) \}\)/);
 });

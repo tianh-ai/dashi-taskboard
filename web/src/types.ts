@@ -12,6 +12,7 @@ export const TASK_PRIORITIES = ["none", "urgent", "high", "medium", "low"] as co
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 export type TaskPriority = (typeof TASK_PRIORITIES)[number];
 export type ActorType = "user" | "agent";
+export type SessionRole = "admin" | "member";
 export type AssigneeTarget = "current-user" | "codex-agent";
 export type IssueRelationType = "parent" | "blocks" | "blocked_by" | "related";
 
@@ -20,6 +21,19 @@ export interface ActorIdentity {
   id: string;
   name: string;
   avatarUrl: string | null;
+}
+
+export interface ProjectMessage {
+  sequence: number;
+  id: string;
+  projectId: string;
+  taskId: string | null;
+  replyToMessageId: string | null;
+  kind: "message" | "progress" | "decision";
+  body: string;
+  mentions: string[];
+  author: ActorIdentity;
+  createdAt: string;
 }
 
 export type DevelopmentContext =
@@ -169,6 +183,59 @@ export interface Project {
   name: string;
   workspacePath: string | null;
   issueCount: number;
+  hiddenAt: string | null;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  devices?: Array<{
+    deviceId: string;
+    deviceName: string;
+    hostname: string | null;
+    status: "online" | "offline" | "error";
+    codexProjectId: string;
+    workspacePath: string;
+    lastSeenAt: string;
+  }>;
+}
+
+export interface ProjectMember {
+  projectId: string;
+  userId: string;
+  userName: string;
+  userAvatarUrl: string | null;
+  role: "member" | "manager" | "admin";
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentLease {
+  taskId: string;
+  expiresAt: string;
+}
+
+export interface AgentStatus {
+  id: string;
+  name: string;
+  device: string;
+  capabilities: string[];
+  projects: string[];
+  concurrency: number;
+  lastHeartbeatAt: string | null;
+  online: boolean;
+  activeLeases: AgentLease[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Device {
+  id: string;
+  name: string;
+  hostname: string | null;
+  status: "online" | "offline" | "error";
+  projectCount: number;
+  taskCount: number;
+  lastSeenAt: string | null;
+  lastError: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -190,6 +257,15 @@ export interface TaskRelations {
   blockedBy: TaskRelationSummary[];
   blocks: TaskRelationSummary[];
   related: TaskRelationSummary[];
+}
+
+export interface TaskReview {
+  id: string;
+  taskId: string;
+  decision: "approved" | "changes_requested";
+  note: string | null;
+  reviewer: ActorIdentity;
+  createdAt: string;
 }
 
 export interface Task {
@@ -214,6 +290,7 @@ export interface Task {
   recurrence: Recurrence | null;
   archivedAt: string | null;
   relations: TaskRelations;
+  latestReview: TaskReview | null;
   version: number;
   createdAt: string;
   updatedAt: string;

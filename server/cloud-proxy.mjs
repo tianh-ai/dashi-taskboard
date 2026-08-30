@@ -207,8 +207,7 @@ export function createCloudProxy({
 
       const sourceUrl = new URL(request.url);
       const upstreamUrl = new URL(
-        `${sourceUrl.pathname}${sourceUrl.search}`,
-        `${remoteUrl}/`,
+        `${remoteUrl}${sourceUrl.pathname}${sourceUrl.search}`,
       );
       const headers = new Headers(request.headers);
       headers.delete("authorization");

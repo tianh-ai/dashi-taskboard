@@ -1,0 +1,23 @@
+Host mini
+  HostName 100.124.204.60
+  User tianmac
+  IdentityFile /var/lib/dashi-taskboard/.ssh/id_ed25519
+  IdentitiesOnly yes
+  BatchMode yes
+  StrictHostKeyChecking yes
+
+Host macbook
+  HostName 100.110.55.63
+  User haitian
+  IdentityFile /var/lib/dashi-taskboard/.ssh/id_ed25519
+  IdentitiesOnly yes
+  BatchMode yes
+  StrictHostKeyChecking yes
+
+Host nas
+  HostName 100.111.247.121
+  User kejishu54s
+  IdentityFile /var/lib/dashi-taskboard/.ssh/id_ed25519
+  IdentitiesOnly yes
+  BatchMode yes
+  StrictHostKeyChecking yes

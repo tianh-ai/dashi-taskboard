@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tianmac.dashi-taskboard-backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/tianmac/Documents/技能管理及日常管理/dashi-taskboard/scripts/backup-local-data.mjs</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/tianmac/Documents/技能管理及日常管理/dashi-taskboard</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>CODEX_TASKBOARD_DATA_DIR</key>
+    <string>/Users/tianmac/Applications/dashi-taskboard/.data</string>
+    <key>CODEX_TASKBOARD_BACKUP_DIR</key>
+    <string>/Users/tianmac/Applications/dashi-taskboard/backups</string>
+    <key>CODEX_TASKBOARD_BACKUP_RETAIN_COUNT</key>
+    <string>14</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>10</integer>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/tianmac/Library/Logs/dashi-taskboard/backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/tianmac/Library/Logs/dashi-taskboard/backup-error.log</string>
+</dict>
+</plist>

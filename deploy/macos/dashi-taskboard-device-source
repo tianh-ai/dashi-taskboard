@@ -1,0 +1,15 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  "cat /Users/tianmac/.codex/.codex-global-state.json")
+    exec /bin/cat /Users/tianmac/.codex/.codex-global-state.json
+    ;;
+  "cat /Users/haitian/.codex/.codex-global-state.json")
+    exec /bin/cat /Users/haitian/.codex/.codex-global-state.json
+    ;;
+  *)
+    exit 64
+    ;;
+esac

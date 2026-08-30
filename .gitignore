@@ -8,3 +8,4 @@ cloud-migration-exports/
 .playwright-cli/
 *.log
 .DS_Store
+.hermes/

@@ -735,8 +735,8 @@ done
   assert.equal(result.response.status, 200);
   assert.deepEqual(result.body, {
     skills: [
-      { id: "repo-skill", label: "Repository Skill", scope: "repo" },
-      { id: "user-skill", label: "user-skill", scope: "user" },
+      { id: "repo-skill", label: "Repository Skill", description: "", path: "", scope: "repo" },
+      { id: "user-skill", label: "user-skill", description: "", path: "", scope: "user" },
     ],
     mcpServers: [
       { id: "context7", label: "context7", transport: "streamable_http" },

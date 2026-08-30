@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tianmac.dashi-taskboard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/tianmac/.local/bin/dashi-taskboard-start</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/tianmac/Documents/技能管理及日常管理/dashi-taskboard</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/tianmac/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>CODEX_EXECUTABLE</key>
+    <string>/Applications/ChatGPT.app/Contents/Resources/codex</string>
+    <key>CODEX_TASKBOARD_HOST</key>
+    <string>127.0.0.1</string>
+    <key>CODEX_TASKBOARD_DATA_DIR</key>
+    <string>/Users/tianmac/Applications/dashi-taskboard/.data</string>
+    <key>CODEX_TASKBOARD_WECOM_ENABLED</key>
+    <string>true</string>
+    <key>CODEX_TASKBOARD_WECOM_AGENT_ID</key>
+    <string>1000003</string>
+    <key>CODEX_TASKBOARD_WECOM_CORP_ID</key>
+    <string>ww513f015ddf22e0f8</string>
+    <key>CODEX_TASKBOARD_WECOM_DEV_MODE</key>
+    <string>false</string>
+    <key>CODEX_TASKBOARD_WECOM_PUBLIC_URL</key>
+    <string>https://workbuddy.lnhsjs.com/wecom/app/1000003/taskboard</string>
+    <key>CODEX_TASKBOARD_WECOM_PROXY_URL</key>
+    <string>http://127.0.0.1:11090</string>
+    <key>CODEX_TASKBOARD_WECOM_DEV_USER_ID</key>
+    <string>TianJiYuan</string>
+    <key>CODEX_TASKBOARD_WECOM_DEV_USER_NAME</key>
+    <string>田济源</string>
+    <key>CODEX_TASKBOARD_ADMIN_USER_IDS</key>
+    <string>TianJiYuan</string>
+    <key>CODEX_TASKBOARD_DEVICE_SYNC_INTERVAL_MS</key>
+    <string>300000</string>
+    <key>CODEX_TASKBOARD_DEVICE_SOURCES</key>
+    <string>[
+      {"id":"mini","name":"Mac Mini","hostname":"tianmacdeMac-mini.local","statePath":"/Users/tianmac/.codex/.codex-global-state.json","local":true},
+      {"id":"macbook","name":"MacBook Pro","hostname":"HaideMacBook-Pro.local","sshHost":"macbook","statePath":"/Users/haitian/.codex/.codex-global-state.json"}
+    ]</string>
+    <key>HTTP_PROXY</key>
+    <string>http://127.0.0.1:11090</string>
+    <key>HTTPS_PROXY</key>
+    <string>http://127.0.0.1:11090</string>
+    <key>ALL_PROXY</key>
+    <string>http://127.0.0.1:11090</string>
+    <key>NO_PROXY</key>
+    <string>127.0.0.1,localhost</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/tianmac/Library/Logs/dashi-taskboard/service.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/tianmac/Library/Logs/dashi-taskboard/service-error.log</string>
+</dict>
+</plist>

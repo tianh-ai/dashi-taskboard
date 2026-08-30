@@ -109,13 +109,15 @@ test("cloud config persists Basic Auth credentials and device mappings in a mode
   assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), await store.read());
 });
 
-test("cloud config only accepts HTTPS origins, except loopback HTTP used in development", async () => {
+test("cloud config only accepts HTTPS URLs, except loopback HTTP used in development", async () => {
   const { createCloudConfigStore } = await importCloudConfig();
 
   for (const remoteUrl of [
     "http://tasks.example.test",
     "ftp://tasks.example.test",
-    "https://tasks.example.test/path",
+    "https://tasks.example.test/path?query=1",
+    "https://tasks.example.test/path#fragment",
+    "https://user:pass@tasks.example.test",
   ]) {
     const store = createCloudConfigStore({
       configPath: await temporaryConfigPath("invalid.json"),
@@ -127,16 +129,17 @@ test("cloud config only accepts HTTPS origins, except loopback HTTP used in deve
     );
   }
 
-  for (const remoteUrl of [
-    "https://tasks.example.test",
-    "http://127.0.0.1:8787",
-    "http://localhost:8787",
+  for (const [remoteUrl, normalized] of [
+    ["https://tasks.example.test", "https://tasks.example.test"],
+    ["https://tasks.example.test/wecom/app/1000003/taskboard/", "https://tasks.example.test/wecom/app/1000003/taskboard"],
+    ["http://127.0.0.1:8787", "http://127.0.0.1:8787"],
+    ["http://localhost:8787", "http://localhost:8787"],
   ]) {
     const store = createCloudConfigStore({
       configPath: await temporaryConfigPath("valid.json"),
     });
     await store.configure({ remoteUrl, actorName: "Alice", sharedKey: "shared-key" });
-    assert.equal((await store.read()).remoteUrl, remoteUrl);
+    assert.equal((await store.read()).remoteUrl, normalized, remoteUrl);
   }
 });
 
@@ -520,6 +523,7 @@ test("configured server proxies business APIs without touching local rows and ad
       realtime: { transport: "poll", intervalMs: 2000 },
       localCapabilities: { available: true },
       manageTaskboardSkillPath: app.options.skillPath,
+      capabilities: { localAiChat: true },
     });
     const session = await fetch(`${baseUrl}/api/local/cloud-session`)
       .then((response) => response.json());

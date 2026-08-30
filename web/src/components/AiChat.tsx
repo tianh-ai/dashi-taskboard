@@ -1265,6 +1265,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
       setCatalogError(null);
       return;
     }
+    if (!panelOpen) return;
     const controller = new AbortController();
     setCatalog(null);
     setCatalogLoadedProjectId(null);
@@ -1286,7 +1287,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
       },
     );
     return () => controller.abort();
-  }, [available, catalogProjectId]);
+  }, [available, catalogProjectId, panelOpen]);
 
   const restoreDraftSettings = useCallback((thread: AiChatThread) => {
     setDraftModel(thread.model);
@@ -2240,6 +2241,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
                 onInput={() => {
                   syncComposerState();
                   updateComposerSkillQuery(true);
+                  queueMicrotask(() => updateComposerSkillQuery());
                 }}
                 onClick={(event) => {
                   const token = (event.target as HTMLElement).closest<HTMLElement>(

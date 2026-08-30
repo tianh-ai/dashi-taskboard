@@ -1,0 +1,30 @@
+[Unit]
+Description=Dashi Taskboard
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dashi-taskboard
+Group=dashi-taskboard
+WorkingDirectory=/opt/dashi-taskboard/current
+EnvironmentFile=/etc/dashi-taskboard/env
+Environment=HOME=/var/lib/dashi-taskboard
+Environment=PATH=/opt/dashi-taskboard/node/bin:/usr/bin:/bin
+ExecStart=/opt/dashi-taskboard/node/bin/node server/index.mjs
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dashi-taskboard
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

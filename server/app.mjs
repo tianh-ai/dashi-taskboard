@@ -712,6 +712,10 @@ function dispatchAgentMentions(database, events, projectId, message) {
     || !message.mentions
     || message.mentions.length === 0
   ) return null;
+  // 密钥认证者（Basic 无 client 头会得到 type:"user"、id:"basic:<name>" 的演员）
+  // 绝不算人类：否则任一 Agent 省略 client 头即可 @自己 触发自激励派发循环。
+  // 真实人类只来自 WeCom 会话 / loopback local-user / companion 代发。
+  if (typeof message.author.id === "string" && message.author.id.startsWith("basic:")) return null;
   const targets = [];
   let anyAgent = false;
   for (const mention of message.mentions) {
@@ -2154,7 +2158,9 @@ export function createTaskboardServer(options = {}) {
                   || event.payload.agentId === username
                 )
               ))
-              : allEvents;
+              // 旧部署回退视角（workbuddy-agent）：桥接组件不需要治理事件，
+              // 管理员批注（agent.review）不得泄露给半信任的桥。
+              : allEvents.filter((event) => event.eventType !== "agent.review");
             result = {
               events: eventsForAgent,
               // 无新事件时返回服务端最大 sequence（而非回显 after）：

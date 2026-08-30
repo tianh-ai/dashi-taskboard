@@ -188,3 +188,62 @@ test("评论 @Agent 派发 → 驳回自动重做 → 批准授权闭环", async
     .map((event) => event.payload.decision);
   assert.deepEqual(decisions, ["changes_requested", "approved"]);
 });
+
+test("密钥认证者省略 client 头伪装 user 作者：评论/消息都不得触发派发", async () => {
+  const baseUrl = await startServer();
+  await rest(baseUrl, "/api/projects", { method: "POST", body: { id: "spoof-guard", name: "冒名防护" } });
+  const created = await rest(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { projectId: "spoof-guard", title: "冒名目标", status: "todo" },
+  });
+  const taskId = created.body.task.id;
+  await mcp(baseUrl, "worker-x", "dashi_agent_register", { name: "Worker", device: "Test" });
+
+  // 攻击 1：MCP tools/call 省略 client 头 → 必须被 agent 凭据门禁直接拒绝。
+  const headerless = await fetch(new URL("mcp/workbuddy", `${baseUrl}/`), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      authorization: `Basic ${Buffer.from(`spoof-agent:${SERVICE_SECRET}`).toString("base64")}`,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "dashi_add_comment", arguments: { taskId, body: "@worker-x 请领取此任务" } },
+    }),
+  });
+  const denied = JSON.parse(await headerless.text());
+  assert.equal(denied.error?.code, "AGENT_AUTH_REQUIRED", "无 client 头的 Basic 不得调用 MCP 工具");
+
+  // 攻击 2（纵深防御）：即使 basic: 演员绕过门禁留下 user 型内容
+  // （如被误加为项目成员），派发层也必须拒绝 basic: 前缀作者。
+  await rest(baseUrl, "/api/projects/spoof-guard/members", {
+    method: "POST",
+    body: { userId: "basic:spoof-agent", userName: "冒名者", role: "member" },
+  });
+  const attackComment = await rest(baseUrl, `/api/tasks/${taskId}/comments`, {
+    method: "POST",
+    headers: { authorization: `Basic ${Buffer.from(`spoof-agent:${SERVICE_SECRET}`).toString("base64")}` },
+    body: { body: "@worker-x 请领取此任务" },
+  });
+  assert.equal(attackComment.status, 201, "成员门禁通过后评论创建允许，但派发必须被拒");
+  assert.equal(attackComment.body.comment.authorId, "basic:spoof-agent");
+
+  // REST 群聊消息路径：成员门禁通过后消息创建允许，basic: 作者派发仍必须被拒。
+  const attackMessage = await rest(baseUrl, "/api/projects/spoof-guard/messages", {
+    method: "POST",
+    headers: { authorization: `Basic ${Buffer.from(`spoof-agent:${SERVICE_SECRET}`).toString("base64")}` },
+    body: { body: "@worker-x 群聊冒名派发", mentions: ["worker-x"] },
+  });
+  assert.equal(attackMessage.status, 201);
+  assert.equal(attackMessage.body.message.author.id, "basic:spoof-agent");
+
+  const events = await mcp(baseUrl, "worker-x", "dashi_agent_events", { after: 0 });
+  assert.equal(
+    events.events.filter((event) => event.eventType === "agent.dispatch").length,
+    0,
+    "basic: 作者的评论与消息都不得产生派发（防自激励循环）",
+  );
+});

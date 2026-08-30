@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { realpathSync } from "node:fs";
 import { afterEach, test } from "node:test";
 
 import { createTaskboardServer } from "../server/index.mjs";
@@ -172,10 +173,25 @@ test("an expired lease lets another worker take over the same dispatch", async (
   assert.match(bodies, /【接管完成】Rescue·NAS/);
 });
 
-test("the exec runner passes task context through env vars and records its output", async () => {
-  const { baseUrl } = await startServer();
-  const execArgv = [process.execPath, "-e", "console.log(`handled ${process.env.DASHI_TASK_TITLE} in ${process.env.DASHI_PROJECT_ID}`)"];
-  const { worker } = makeWorker(baseUrl, "worker-exec", { exec: JSON.stringify(execArgv), name: "Exec", device: "Mini" });
+test("the exec runner receives the prompt on stdin, runs in the mapped workspace, and records its output", async () => {
+  const { baseUrl, directory } = await startServer();
+  const execArgv = [process.execPath, "-e", `
+    const chunks = [];
+    process.stdin.on("data", (chunk) => chunks.push(chunk));
+    process.stdin.on("end", () => {
+      const prompt = Buffer.concat(chunks).toString("utf8");
+      const viaStdin = prompt.includes("用外部命令处理");
+      const viaEnv = process.env.DASHI_PROJECT_ID === "worker-exec";
+      const inWorkspace = process.cwd();
+      console.log(JSON.stringify({ viaStdin, viaEnv, inWorkspace }));
+    });
+  `];
+  const { worker } = makeWorker(baseUrl, "worker-exec", {
+    exec: JSON.stringify(execArgv),
+    name: "Exec",
+    device: "Mini",
+    workspaceMap: { "worker-exec": directory },
+  });
   await worker.register();
 
   await rest(baseUrl, "/api/projects", {
@@ -189,12 +205,134 @@ test("the exec runner passes task context through env vars and records its outpu
 
   const outcomes = await worker.pollOnce({ cursor: 0 });
   assert.equal(outcomes[0].status, "done");
-  assert.match(outcomes[0].execution.summary, /handled .*? in worker-exec/);
+  const marker = outcomes[0].execution.summary.indexOf("{");
+  const report = JSON.parse(outcomes[0].execution.summary.slice(marker, outcomes[0].execution.summary.lastIndexOf("}") + 1));
+  assert.equal(report.viaStdin, true, "任务提示词必须经 stdin 传入");
+  assert.equal(report.viaEnv, true);
+  assert.equal(report.inWorkspace, realpathSync(directory), "Runner 必须在映射的工作区内运行");
 
   const events = await worker.mcp.call("dashi_agent_events", { after: 0 });
   const dispatch = events.events.find((event) => event.eventType === "agent.dispatch");
   const taskDetail = await worker.mcp.call("dashi_get_task", { taskId: dispatch.payload.taskId });
   assert.equal(taskDetail.task.status, "in_review");
+});
+
+test("a project without a workspace mapping is refused, never executed in the worker's own directory", async () => {
+  const { baseUrl } = await startServer();
+  const execArgv = [process.execPath, "-e", "console.log('should never run')"];
+  const { worker } = makeWorker(baseUrl, "worker-unmapped", {
+    exec: JSON.stringify(execArgv),
+    name: "Unmapped",
+    device: "Mini",
+  });
+  await worker.register();
+
+  await rest(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "worker-unmapped", name: "未映射" },
+  });
+  await rest(baseUrl, "/api/projects/worker-unmapped/messages", {
+    method: "POST",
+    body: { body: "@Agent 未映射项目", mentions: ["agent"] },
+  });
+
+  const state = { cursor: 0, pending: [] };
+  const outcomes = await worker.pollOnce(state);
+  assert.equal(outcomes[0].status, "refused");
+  assert.equal(outcomes[0].reason, "NO_WORKSPACE_MAPPING");
+  assert.match(outcomes[0].execution.summary, /未配置工作区映射/);
+
+  const events = await worker.mcp.call("dashi_agent_events", { after: 0 });
+  const dispatch = events.events.find((event) => event.eventType === "agent.dispatch");
+  const taskDetail = await worker.mcp.call("dashi_get_task", { taskId: dispatch.payload.taskId });
+  assert.equal(taskDetail.task.status, "todo", "被拒绝的任务必须释放回 todo，不得进入 in_review");
+  assert.equal(state.pending.length, 0, "工作区拒绝不可重试，不得滞留 pending");
+});
+
+test("a failing runner writes a failure summary, releases the task, and never submits for review", async () => {
+  const { baseUrl, directory } = await startServer();
+  const execArgv = [process.execPath, "-e", "console.error('runner exploded'); process.exit(3)"];
+  const { worker } = makeWorker(baseUrl, "worker-fail", {
+    exec: JSON.stringify(execArgv),
+    name: "Fail",
+    device: "Mini",
+    workspaceMap: { "worker-fail": directory },
+  });
+  await worker.register();
+
+  await rest(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "worker-fail", name: "失败回写" },
+  });
+  await rest(baseUrl, "/api/projects/worker-fail/messages", {
+    method: "POST",
+    body: { body: "@Agent 必定失败的任务", mentions: ["agent"] },
+  });
+
+  const outcomes = await worker.pollOnce({ cursor: 0, pending: [] });
+  assert.equal(outcomes[0].status, "failed");
+  assert.equal(outcomes[0].reason, "RUNNER_FAILED");
+
+  const events = await worker.mcp.call("dashi_agent_events", { after: 0 });
+  const dispatch = events.events.find((event) => event.eventType === "agent.dispatch");
+  const taskDetail = await worker.mcp.call("dashi_get_task", { taskId: dispatch.payload.taskId });
+  assert.equal(taskDetail.task.status, "todo", "失败任务必须释放回队列");
+  const messages = await rest(baseUrl, "/api/projects/worker-fail/messages");
+  const bodies = messages.body.messages.map((message) => message.body).join("\n");
+  assert.match(bodies, /【执行失败】Fail·Mini/);
+  assert.match(bodies, /runner exploded/);
+});
+
+test("a deferred LEASE_HELD dispatch stays pending and naturally takes over after lease expiry", async () => {
+  const { baseUrl, directory } = await startServer();
+  const primary = makeWorker(baseUrl, "worker-primary", { name: "Primary", device: "Mini" });
+  const standby = makeWorker(baseUrl, "worker-standby", { name: "Standby", device: "NAS" });
+  await primary.worker.register();
+  await standby.worker.register();
+
+  await rest(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "worker-natural-takeover", name: "自然接管" },
+  });
+  await rest(baseUrl, "/api/projects/worker-natural-takeover/messages", {
+    method: "POST",
+    body: { body: "@Agent 自然接管测试", mentions: ["agent"] },
+  });
+
+  // 主 Worker 只领取不执行，模拟拿到任务后掉线（进程仍在，租约有效）。
+  const events = await standby.worker.mcp.call("dashi_agent_events", { after: 0 });
+  const dispatch = events.events.find((event) => event.eventType === "agent.dispatch");
+  const claim = await primary.worker.mcp.call("dashi_claim_task", {
+    taskId: dispatch.payload.taskId,
+    leaseSeconds: 600,
+  });
+  assert.equal(claim.task.assignee.id, "worker-primary");
+
+  // 备用 Worker 轮询：撞上 LEASE_HELD → 保存 pending，不丢弃、不视为终态。
+  const state = { cursor: 0, pending: [] };
+  const first = await standby.worker.pollOnce(state);
+  assert.equal(first.length, 1);
+  assert.equal(first[0].status, "deferred");
+  assert.equal(first[0].reason, "LEASE_HELD");
+  assert.equal(state.pending.length, 1, "LEASE_HELD 派发必须保留在 pending");
+
+  // 不重新发送消息、不重新派发事件：租约自然过期后，同一状态再次轮询即接管。
+  const database = new DatabaseSync(path.join(directory, "taskboard.sqlite"));
+  database.prepare("UPDATE task_leases SET expires_at = ? WHERE task_id = ?")
+    .run("2000-01-01T00:00:00.000Z", dispatch.payload.taskId);
+  database.close();
+
+  const second = await standby.worker.pollOnce(state);
+  assert.equal(second.length, 1);
+  assert.equal(second[0].status, "done", JSON.stringify(second));
+  assert.equal(state.pending.length, 0, "接管完成后 pending 清空");
+
+  const taskDetail = await standby.worker.mcp.call("dashi_get_task", { taskId: dispatch.payload.taskId });
+  assert.equal(taskDetail.task.assignee.id, "worker-standby");
+  assert.equal(taskDetail.task.status, "in_review");
+  const messages = await rest(baseUrl, "/api/projects/worker-natural-takeover/messages");
+  const bodies = messages.body.messages.map((message) => message.body).join("\n");
+  assert.match(bodies, /【接管】Standby·NAS 接管任务/);
 });
 
 test("worker config resolution enforces credentials and validates the exec contract", async () => {

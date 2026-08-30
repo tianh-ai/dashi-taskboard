@@ -42,6 +42,23 @@ function requiredString(value, field) {
   return value.trim();
 }
 
+// workspaceMap：projectId → 本机绝对工作区。支持对象或 JSON 字符串（env 注入）。
+function parseWorkspaceMap(value) {
+  if (!value) return null;
+  let map = value;
+  if (typeof value === "string") {
+    try {
+      map = JSON.parse(value);
+    } catch {
+      throw new WorkerError("Invalid workspaceMap config: must be a JSON object", "INVALID_CONFIG");
+    }
+  }
+  if (typeof map !== "object" || Array.isArray(map) || Object.values(map).some((v) => typeof v !== "string")) {
+    throw new WorkerError("Invalid workspaceMap config: must map projectId → absolute path", "INVALID_CONFIG");
+  }
+  return map;
+}
+
 export function resolveWorkerConfig(raw, env = process.env) {
   const source = { ...raw };
   for (const [key, envKey] of [
@@ -52,6 +69,8 @@ export function resolveWorkerConfig(raw, env = process.env) {
     ["device", "DASHI_WORKER_DEVICE"],
     ["exec", "DASHI_WORKER_EXEC"],
     ["statePath", "DASHI_WORKER_STATE"],
+    ["workspaceMap", "DASHI_WORKER_WORKSPACE_MAP"],
+    ["defaultWorkspace", "DASHI_WORKER_DEFAULT_WORKSPACE"],
   ]) {
     if (source[key] === undefined && env[envKey] !== undefined) source[key] = env[envKey];
   }
@@ -71,6 +90,10 @@ export function resolveWorkerConfig(raw, env = process.env) {
     eventLimit: Number(source.eventLimit ?? WORKER_DEFAULTS.eventLimit),
     execTimeoutMs: Number(source.execTimeoutMs ?? WORKER_DEFAULTS.execTimeoutMs),
     statePath: typeof source.statePath === "string" && source.statePath ? source.statePath : null,
+    workspaceMap: parseWorkspaceMap(source.workspaceMap),
+    defaultWorkspace: typeof source.defaultWorkspace === "string" && source.defaultWorkspace.trim()
+      ? source.defaultWorkspace.trim()
+      : null,
   };
   if (typeof source.exec === "string" && source.exec.trim()) {
     try {
@@ -147,12 +170,14 @@ export function createMcpClient({ baseUrl, username, secret, clientTag, fetch: f
   return { call };
 }
 
-function runExec(argv, env, timeoutMs) {
+function runExec(argv, env, timeoutMs, input = "", cwd = undefined, runnerControl = null) {
   return new Promise((resolve) => {
     const child = spawn(argv[0], argv.slice(1), {
       env: { ...process.env, ...env },
-      stdio: ["ignore", "pipe", "pipe"],
+      cwd,
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    if (runnerControl) runnerControl.kill = () => child.kill("SIGKILL");
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -167,6 +192,8 @@ function runExec(argv, env, timeoutMs) {
     };
     child.stdout.on("data", (chunk) => { stdout += String(chunk); });
     child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.stdin.on("error", () => {});
+    child.stdin.end(input);
     child.on("error", (error) => {
       stderr += String(error);
       finish(-1, null);
@@ -199,8 +226,28 @@ export function createTaskWorker(config, deps = {}) {
     return result.agent;
   }
 
-  async function executeTask(dispatch, task) {
+  async function executeTask(dispatch, task, runnerControl = null) {
     if (config.exec) {
+      const workspace = config.workspaceMap?.[dispatch.projectId] ?? config.defaultWorkspace ?? undefined;
+      if (workspace === undefined) {
+        // 工作区守卫：未映射的项目绝不能落到 Worker 进程的当前目录
+        // （那可能是 dashi-taskboard 仓库本身）。
+        return {
+          summary: `【执行失败】项目 ${dispatch.projectId} 未配置工作区映射（workspaceMap），已拒绝执行。`,
+          ok: false,
+          refused: true,
+        };
+      }
+      const prompt = [
+        "你是 Dashi Taskboard 的执行 Agent。请在给定工作区完成下列任务，以可验证结果为目标。",
+        "不要自行把任务标记为完成或审批；常驻 Worker 会负责回写和提交人工审核。",
+        `项目：${dispatch.projectId}`,
+        `任务：${task.title ?? task.id}`,
+        `任务 ID：${task.id}`,
+        `员工请求：${dispatch.body ?? "（无）"}`,
+        task.description ? `任务说明：\n${task.description}` : "",
+        "完成后请简洁报告：实际改动、验证结果、剩余风险。",
+      ].filter(Boolean).join("\n\n");
       const execution = await execRunner(config.exec, {
         DASHI_TASK_ID: task.id,
         DASHI_TASK_TITLE: task.title ?? "",
@@ -208,7 +255,7 @@ export function createTaskWorker(config, deps = {}) {
         DASHI_PROJECT_ID: dispatch.projectId,
         DASHI_MESSAGE_ID: dispatch.messageId,
         DASHI_WORKER: config.username,
-      }, config.execTimeoutMs);
+      }, config.execTimeoutMs, prompt, workspace, runnerControl);
       const output = execution.stdout.trim() || execution.stderr.trim() || "(无输出)";
       const status = execution.code === 0 ? "执行完成" : `执行退出码 ${execution.code}`;
       return { summary: `【执行结果】${status}\n\n${output}`, ok: execution.code === 0 };
@@ -248,7 +295,10 @@ export function createTaskWorker(config, deps = {}) {
         // LEASE_HELD：其他 Worker 持有租约；TASK_NOT_CLAIMABLE：任务已被处理（如 in_review）。
         // 两者都说明本 Worker 无需重复执行，重放派发事件时保持幂等。
         log(`dispatch ${dispatch.taskId} not claimable (${error.code}); skipping`);
-        return { status: "skipped", reason: error.code };
+        return {
+          status: error.code === "LEASE_HELD" ? "deferred" : "skipped",
+          reason: error.code,
+        };
       }
       throw error;
     }
@@ -256,8 +306,9 @@ export function createTaskWorker(config, deps = {}) {
     log(`claimed ${task.id}「${task.title}」 (tookOver=${claim.tookOver}) lease→${claim.lease.expiresAt}`);
 
     // 租约丢失感知：LEASE_NOT_HELD 意味着租约已被接管/清理，
-    // 继续回写只会与接管者产生矛盾记录，必须中止后续动作。
+    // 必须立即终止本地 Runner 子进程并禁止一切回写（避免与接管者矛盾/双写）。
     let leaseLost = false;
+    const runnerControl = { kill: () => {} };
     const renewTimer = setInterval(() => {
       mcp.call("dashi_renew_task_lease", {
         taskId: task.id,
@@ -266,8 +317,9 @@ export function createTaskWorker(config, deps = {}) {
         log(`renewed lease on ${task.id} → ${result.lease.expiresAt}`);
       }).catch((error) => {
         if (error.code === "LEASE_NOT_HELD") {
+          if (!leaseLost) runnerControl.kill();
           leaseLost = true;
-          log(`lease on ${task.id} lost (taken over); will skip writeback`);
+          log(`lease on ${task.id} lost (taken over); runner killed, writeback skipped`);
         } else {
           log(`lease renewal failed on ${task.id}: ${error.message}`);
         }
@@ -275,9 +327,30 @@ export function createTaskWorker(config, deps = {}) {
     }, Math.max(10_000, (config.leaseSeconds * 1000) / 3));
 
     try {
-      const execution = await executeTask(dispatch, task);
+      const execution = await executeTask(dispatch, task, runnerControl);
       if (leaseLost) {
         return { status: "aborted", reason: "LEASE_LOST", execution };
+      }
+      if (!execution.ok) {
+        // Runner 失败/拒绝执行：失败摘要写入任务与群聊，释放任务回队列，
+        // 绝不把失败成果提交 in_review。
+        await mcp.call("dashi_add_comment", { taskId: task.id, body: execution.summary });
+        await mcp.call("dashi_post_project_message", {
+          projectId: dispatch.projectId,
+          body: `【执行失败】${config.name}·${config.device} 未能完成「${task.title}」，任务已退回队列。\n\n${execution.summary}`,
+          kind: "progress",
+          taskId: task.id,
+        });
+        try {
+          await mcp.call("dashi_release_task", { taskId: task.id, reason: `Runner 执行失败：${execution.summary.slice(0, 200)}` });
+        } catch (releaseError) {
+          log(`release after runner failure failed: ${releaseError.message}`);
+        }
+        if (execution.refused) {
+          // 工作区未映射是配置错误，重试无意义：不滞留 pending。
+          return { status: "refused", reason: "NO_WORKSPACE_MAPPING", execution };
+        }
+        return { status: "failed", reason: "RUNNER_FAILED", execution };
       }
       const comment = await mcp.call("dashi_add_comment", { taskId: task.id, body: execution.summary });
       await mcp.call("dashi_post_project_message", {
@@ -314,6 +387,7 @@ export function createTaskWorker(config, deps = {}) {
   }
 
   async function pollOnce(state) {
+    if (!Array.isArray(state.pending)) state.pending = [];
     let after = state.cursor;
     let result = await mcp.call("dashi_agent_events", {
       after,
@@ -341,8 +415,10 @@ export function createTaskWorker(config, deps = {}) {
       let outcome = null;
       try {
         if (event.eventType === "agent.dispatch") {
-          log(`dispatch event #${event.sequence} for task ${event.payload.taskId} (${event.payload.anyAgent ? "@Agent" : "定向"})`);
-          outcome = await handleDispatch(event.payload);
+          if (!state.pending.some((item) => item.sequence === event.sequence)) {
+            state.pending.push({ sequence: event.sequence, dispatch: event.payload });
+            await deps.persistState?.(state);
+          }
         } else if (event.eventType === "agent.review" && event.payload.agentId === config.username) {
           if (event.payload.decision === "changes_requested") {
             // 管理员驳回：作为新派发重新领取执行（每轮重做都由人类审批触发，不会失控循环）。
@@ -383,7 +459,7 @@ export function createTaskWorker(config, deps = {}) {
         }
       }
       if (outcome) outcomes.push(outcome);
-      // 逐事件推进游标：已处理的事件绝不被重放（避免重复执行外部命令）。
+      // 派发先持久化到 pending，再推进事件游标。即使进程此刻崩溃，任务也不会丢。
       if (event.sequence > state.cursor) {
         state.cursor = event.sequence;
         await deps.persistState?.(state);
@@ -393,6 +469,33 @@ export function createTaskWorker(config, deps = {}) {
       state.cursor = result.nextCursor;
       await deps.persistState?.(state);
     }
+    const remaining = [];
+    for (const item of state.pending) {
+      let outcome;
+      try {
+        log(`pending dispatch #${item.sequence} for task ${item.dispatch.taskId} (${item.dispatch.anyAgent ? "@Agent" : "定向"})`);
+        outcome = await handleDispatch(item.dispatch);
+      } catch (error) {
+        if (error.code === "AGENT_NOT_FOUND") {
+          try { await register(); } catch {}
+        }
+        if (UNRECOVERABLE_EVENT_ERRORS.has(error.code)) {
+          // 毒派发（任务/项目已删除、负载非法）：丢弃，不得无限重试。
+          log(`pending dispatch #${item.sequence} unrecoverable (${error.code}); dropping`);
+          outcomes.push({ status: "skipped", reason: error.code });
+          continue;
+        }
+        log(`pending dispatch #${item.sequence} failed (${error.code ?? error.message}); retaining`);
+        remaining.push(item);
+        continue;
+      }
+      outcomes.push(outcome);
+      if (outcome.status === "deferred" || outcome.status === "failed" || outcome.status === "aborted") {
+        remaining.push(item);
+      }
+    }
+    state.pending = remaining;
+    await deps.persistState?.(state);
     return outcomes;
   }
 
@@ -400,14 +503,16 @@ export function createTaskWorker(config, deps = {}) {
 }
 
 export async function loadState(statePath) {
-  if (!statePath) return { cursor: 0 };
+  if (!statePath) return { cursor: 0, pending: [] };
   try {
     const parsed = JSON.parse(await readFile(statePath, "utf8"));
-    if (Number.isSafeInteger(parsed.cursor) && parsed.cursor >= 0) return { cursor: parsed.cursor };
+    if (Number.isSafeInteger(parsed.cursor) && parsed.cursor >= 0) {
+      return { cursor: parsed.cursor, pending: Array.isArray(parsed.pending) ? parsed.pending : [] };
+    }
   } catch {
     // 首次运行或状态文件损坏：从 0 开始重放，重复派发会被 LEASE_HELD 幂等跳过。
   }
-  return { cursor: 0 };
+  return { cursor: 0, pending: [] };
 }
 
 export async function runWorker(config, { signal, worker } = {}) {

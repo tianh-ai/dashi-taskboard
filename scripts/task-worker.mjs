@@ -292,9 +292,27 @@ export function createTaskWorker(config, deps = {}) {
     });
     const outcomes = [];
     for (const event of result.events) {
-      if (event.eventType !== "agent.dispatch") continue;
-      log(`dispatch event #${event.sequence} for task ${event.payload.taskId} (${event.payload.anyAgent ? "@Agent" : "定向"})`);
-      outcomes.push(await handleDispatch(event.payload));
+      if (event.eventType === "agent.dispatch") {
+        log(`dispatch event #${event.sequence} for task ${event.payload.taskId} (${event.payload.anyAgent ? "@Agent" : "定向"})`);
+        outcomes.push(await handleDispatch(event.payload));
+        continue;
+      }
+      if (event.eventType === "agent.review" && event.payload.agentId === config.username) {
+        if (event.payload.decision === "changes_requested") {
+          // 管理员驳回：作为新派发重新领取执行（每轮重做都由人类审批触发，不会失控循环）。
+          log(`review event #${event.sequence}: task ${event.payload.taskId} returned; re-running`);
+          outcomes.push(await handleDispatch({
+            taskId: event.payload.taskId,
+            projectId: event.payload.projectId,
+            messageId: null,
+            body: `审批驳回：${event.payload.note ?? "（无备注）"}。请按批注修改后重新提审。`,
+            anyAgent: false,
+            targets: [],
+          }));
+        } else {
+          log(`review event #${event.sequence}: task ${event.payload.taskId} approved`);
+        }
+      }
     }
     if (result.nextCursor > state.cursor) {
       state.cursor = result.nextCursor;

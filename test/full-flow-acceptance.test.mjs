@@ -299,7 +299,10 @@ test("真实数据全流程：员工接入 → 实时同步 → Worker 执行回
     "SELECT sequence, destination, event_type FROM integration_outbox WHERE destination = 'agents' ORDER BY sequence",
   ).all();
   assert.ok(dispatchRows.length >= 1);
-  assert.ok(dispatchRows.every((row) => row.event_type === "agent.dispatch"));
+  assert.ok(
+    dispatchRows.every((row) => row.event_type === "agent.dispatch" || row.event_type === "agent.review"),
+    "agents 通道只允许派发与审批回传事件",
+  );
   const comment = db.prepare(
     "SELECT author_type, author_id FROM comments WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
   ).get(chatTaskId);

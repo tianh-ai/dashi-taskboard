@@ -715,7 +715,7 @@ function dispatchAgentMentions(database, events, projectId, message) {
   const targets = [];
   let anyAgent = false;
   for (const mention of message.mentions) {
-    if (mention === "agent" || mention === "agents" || mention === "codex-agent") {
+    if (["agent", "agents", "codex-agent"].includes(String(mention).toLowerCase())) {
       anyAgent = true;
       continue;
     }
@@ -747,6 +747,37 @@ function dispatchAgentMentions(database, events, projectId, message) {
   if (!message.taskId) database.recordAgentRequestDispatch(message.id, sequence);
   events.emit("project.agent.requested", { projectId, message, dispatch });
   return dispatch;
+}
+
+// 看板评论里的 @提及 从正文文本解析（评论没有结构化 mentions 字段）。
+function commentMentionTokens(body) {
+  const tokens = new Set();
+  for (const match of String(body).matchAll(/@([A-Za-z0-9_\u4e00-\u9fa5][A-Za-z0-9_.\-\u4e00-\u9fa5]{0,95})/g)) {
+    tokens.add(match[1]);
+    if (tokens.size >= 20) break;
+  }
+  return [...tokens];
+}
+
+// 人类用户在任务评论中 @Agent/@具体agent → 进入 agent 派发通道（与群聊 @ 同语义）。
+// 仅限 user 作者：agent 自己的评论绝不触发派发，避免自激励循环。
+function dispatchCommentMentions(database, events, task, comment) {
+  if (!task || comment.authorType !== "user") return null;
+  const mentions = commentMentionTokens(comment.body);
+  if (mentions.length === 0) return null;
+  return dispatchAgentMentions(database, events, task.projectId, {
+    id: comment.id,
+    taskId: comment.taskId,
+    body: comment.body,
+    mentions,
+    author: {
+      type: comment.authorType,
+      id: comment.authorId,
+      name: comment.authorName,
+      avatarUrl: comment.authorAvatarUrl,
+    },
+    createdAt: comment.createdAt,
+  });
 }
 
 function agentSystemMessage(database, events, projectId, body, taskId = null) {
@@ -1915,6 +1946,7 @@ export function createTaskboardServer(options = {}) {
             });
             const task = database.getTask(taskId);
             events.emit("comment.created", { comment, task });
+            dispatchCommentMentions(database, events, task, comment);
             result = { comment, task };
           } else if (toolName === "dashi_list_project_messages") {
             const projectId = stringField(args.projectId, "projectId", { required: true, maxLength: 64 });
@@ -2111,6 +2143,10 @@ export function createTaskboardServer(options = {}) {
                   event.eventType !== "agent.dispatch"
                   || event.payload.anyAgent
                   || event.payload.targets?.some((target) => target.id === username)
+                )
+                && (
+                  event.eventType !== "agent.review"
+                  || event.payload.agentId === username
                 )
               ))
               : allEvents;
@@ -2759,6 +2795,7 @@ export function createTaskboardServer(options = {}) {
           });
           const task = database.getTask(taskId);
           events.emit("comment.created", { comment, task });
+          dispatchCommentMentions(database, events, task, comment);
           return sendJson(response, 201, { comment });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
@@ -3002,6 +3039,19 @@ export function createTaskboardServer(options = {}) {
             : stringField(body.note, "note", { required: true, maxLength: 4000 });
           const task = database.reviewTask(id, version, decision, note, actorFromRequest(request));
           events.emit("task.reviewed", { task, review: task.latestReview });
+          // 授权闭环：审批结果回传指派 agent，让它据此判断下一步（驳回→修改重提）。
+          if (task.assignee?.type === "agent") {
+            database.appendIntegrationEvent("agents", {
+              type: "agent.review",
+              projectId: task.projectId,
+              taskId: task.id,
+              decision,
+              note,
+              agentId: task.assignee.id,
+              taskTitle: task.title,
+              at: task.updatedAt,
+            });
+          }
           return sendJson(response, 200, { task });
         }
         if (action === "archive" && request.method === "POST") {

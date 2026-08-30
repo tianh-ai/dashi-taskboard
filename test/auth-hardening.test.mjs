@@ -233,6 +233,41 @@ test("任何用户名都不能注册别人的 agentId（含 workbuddy-agent 自�
   );
 });
 
+test("额外设备密钥可用且可独立撤销，但不授予任何特权身份", async () => {
+  const baseUrl = await startServer({ serviceExtraSecrets: "device-a-secret,device-b-secret" });
+  const registered = await mcp(baseUrl, "codex-mini", "device-a-secret", "task-worker", "dashi_agent_register", {
+    name: "Codex", device: "Mini",
+  });
+  assert.equal(registered.agent.id, "codex-mini");
+
+  // 设备密钥与共享密钥同域：只能是 agent，不得获得 companion/bridge 特权。
+  const taskId = await stageTaskInReview(baseUrl);
+  const before = await rest(baseUrl, `/api/tasks/${taskId}`);
+  const attack = await rest(baseUrl, `/api/tasks/${taskId}/review`, {
+    method: "POST",
+    headers: {
+      authorization: basic("codex-mini", "device-a-secret"),
+      "x-taskboard-client": "cloud-companion",
+      "x-taskboard-acting-user-id": ADMIN_ID,
+      "x-taskboard-acting-user-name": encodeURIComponent("田纪元"),
+    },
+    body: { version: before.body.task.version, decision: "approve" },
+  });
+  assert.equal(attack.status, 403, "设备密钥 + acting 头不得获得管理员身份");
+
+  // 撤销 device-a（重启时从列表移除）：同一密钥立即失效。
+  const revoked = await startServer({ serviceExtraSecrets: "device-b-secret" });
+  await assert.rejects(
+    mcp(revoked, "codex-mini", "device-a-secret", "task-worker", "dashi_agent_heartbeat", {}),
+    (error) => error.code === "AGENT_AUTH_REQUIRED" || error.code === "UNAUTHORIZED",
+    "被撤销的设备密钥不得再通过认证",
+  );
+  const survivor = await mcp(revoked, "claude-macbook", "device-b-secret", "task-worker", "dashi_agent_register", {
+    name: "Claude", device: "MacBook",
+  });
+  assert.equal(survivor.agent.id, "claude-macbook");
+});
+
 test("同步通道不能把已审批完成的任务打回 todo/in_progress", async () => {
   const baseUrl = await startServer();
   await rest(baseUrl, "/api/projects", { method: "POST", body: { id: "done-guard", name: "完成守护" } });

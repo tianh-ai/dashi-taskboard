@@ -160,6 +160,10 @@ export function resolveWeComConfig(overrides = {}) {
     serviceSecret: String(
       overrides.serviceSecret ?? environment.CODEX_TASKBOARD_SERVICE_SECRET ?? "",
     ),
+    // 每台执行设备一把可独立撤销的服务密钥（同一密钥域，互不可冒充人类/桥）。
+    serviceExtraSecrets: commaSeparated(
+      overrides.serviceExtraSecrets ?? environment.CODEX_TASKBOARD_SERVICE_EXTRA_SECRETS,
+    ).filter((value) => value.length > 0),
     // 专用密钥域：代发用户身份（cloud-companion）与 bridge 冒名绝不能复用
     // 所有 Agent 共享的 serviceSecret，否则任一 Agent 可伪造人类管理员。
     companionSecret: String(
@@ -222,7 +226,8 @@ export function createWeComAuth({ database, config, fetch: fetchImplementation =
     const separator = decoded.indexOf(":");
     if (separator < 1) return null;
     const secret = decoded.slice(separator + 1);
-    const matchesService = equalSecret(secret, config.serviceSecret);
+    const matchesService = equalSecret(secret, config.serviceSecret)
+      || config.serviceExtraSecrets.some((extra) => equalSecret(secret, extra));
     // 特权密钥域：companion 代发与 bridge 冒名各自校验专用密钥。
     const matchesCompanion = Boolean(config.companionSecret) && equalSecret(secret, config.companionSecret);
     const matchesBridge = Boolean(config.bridgeSecret) && equalSecret(secret, config.bridgeSecret);

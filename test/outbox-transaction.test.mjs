@@ -204,6 +204,67 @@ test("回滚不产生幻影 SSE 事件：客户端不得看到未提交的 comme
   await pump;
 });
 
+test("HTTP 任务创建与 outbox 同事务：outbox 写失败时任务不得落库（外部复现用例）", async () => {
+  const { app, baseUrl, directory } = await startServer();
+  const project = await rest(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "tx-task-create", name: "任务创建事务" },
+  });
+  assert.equal(project.status, 201);
+
+  const restore = injectOutboxFailure(app);
+  const created = await rest(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { projectId: "tx-task-create", title: "故障注入窗口内创建的任务" },
+  });
+  restore();
+  assert.equal(created.status, 500, "outbox 写失败必须让任务创建整体失败");
+
+  const after = await rest(baseUrl, `/api/tasks?projectId=tx-task-create`);
+  assert.equal(after.body.tasks.length, 0, "回滚后不得残留任务（外部复现：500 但任务永久存在）");
+  const rawDb = new DatabaseSync(path.join(directory, "taskboard.sqlite"), { readOnly: true });
+  const taskCount = rawDb.prepare("SELECT COUNT(*) AS n FROM tasks WHERE project_id = 'tx-task-create'").get();
+  assert.equal(taskCount.n, 0, "回滚后数据库不得残留任务行");
+  rawDb.close();
+});
+
+test("HTTP 任务更新与 outbox 同事务：outbox 写失败时更新完全回滚", async () => {
+  const { app, baseUrl, directory } = await startServer();
+  await rest(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "tx-task-update", name: "任务更新事务" },
+  });
+  const task = await rest(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { projectId: "tx-task-update", title: "原标题" },
+  });
+  assert.equal(task.status, 201);
+
+  const restore = injectOutboxFailure(app);
+  const patched = await rest(baseUrl, `/api/tasks/${task.body.task.id}`, {
+    method: "PATCH",
+    body: { version: task.body.task.version, title: "不应落库的新标题" },
+  });
+  restore();
+  assert.equal(patched.status, 500, "outbox 写失败必须让更新失败");
+
+  const after = await rest(baseUrl, `/api/tasks/${task.body.task.id}`);
+  assert.equal(after.body.task.title, "原标题", "回滚后标题不得被修改");
+});
+
+test("HTTP 项目创建与 outbox 同事务：outbox 写失败时项目不得落库", async () => {
+  const { app, baseUrl } = await startServer();
+  const restore = injectOutboxFailure(app);
+  const created = await rest(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "tx-project-fail", name: "不应存在的项目" },
+  });
+  restore();
+  assert.equal(created.status, 500);
+  const after = await rest(baseUrl, "/api/projects");
+  assert.ok(!after.body.projects.some((project) => project.id === "tx-project-fail"), "回滚后项目不得残留");
+});
+
 test("嵌套事务：内层抛错时外层整体回滚且连接可继续使用", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "dashi-nested-tx-"));
   try {

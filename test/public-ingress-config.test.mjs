@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -22,24 +22,15 @@ test("the Mini service uses the authenticated public WeCom origin", () => {
   );
 });
 
-test("the public tunnel exposes only the Mini taskboard on Tencent loopback", () => {
-  const tunnelPlist = readFileSync(
-    path.join(
+// 2026-09-01 脑裂事故：Mini 反向隧道在腾讯云重启空窗抢占 47823，导致公网流量
+// 打到旧实例。隧道已永久禁用并从仓库移除——此测试防止它被无意重新引入。
+test("the Mini reverse tunnel must not be reintroduced", () => {
+  assert.equal(
+    existsSync(path.join(
       projectRoot,
       "deploy/macos/com.tianmac.dashi-taskboard-public-tunnel.plist",
-    ),
-    "utf8",
+    )),
+    false,
+    "反向隧道 plist 不得回到仓库（2026-09-01 脑裂根因）",
   );
-
-  assert.match(tunnelPlist, /<string>com\.tianmac\.dashi-taskboard-public-tunnel<\/string>/);
-  assert.match(tunnelPlist, /<string>BatchMode=yes<\/string>/);
-  assert.match(tunnelPlist, /<string>ExitOnForwardFailure=yes<\/string>/);
-  assert.match(tunnelPlist, /<string>StrictHostKeyChecking=yes<\/string>/);
-  assert.match(tunnelPlist, /<string>GatewayPorts=no<\/string>/);
-  assert.match(tunnelPlist, /<string>-R<\/string>/);
-  assert.match(
-    tunnelPlist,
-    /<string>127\.0\.0\.1:47823:127\.0\.0\.1:47823<\/string>/,
-  );
-  assert.match(tunnelPlist, /<string>tencent<\/string>/);
 });

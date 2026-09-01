@@ -2078,22 +2078,25 @@ export function createTaskboardServer(options = {}) {
             const ownerUserId = stringField(args.ownerUserId, "ownerUserId", { required: false, maxLength: 190 }) ?? null;
             const ownerName = stringField(args.ownerName, "ownerName", { required: false, maxLength: 190 }) ?? null;
             const projectId = workbuddyProjectMappingId(workbuddyProjectId);
-            let project = database.getProject(projectId);
-            let created = false;
-            if (!project) {
-              project = database.createProject({ id: projectId, name, workspacePath: null, actor: actorFromRequest(request) });
-              created = true;
-            }
-            if (ownerUserId) {
-              database.upsertProjectMember(projectId, {
-                userId: ownerUserId.slice(0, 96),
-                userName: (ownerName ?? ownerUserId).slice(0, 120),
-                userAvatarUrl: null,
-                role: "manager",
-              });
-              project = database.getProject(projectId);
-            }
-            events.emit("project.member.updated", { projectId, project });
+            const { project, created } = events.withTransaction(database, () => {
+              let project = database.getProject(projectId);
+              let created = false;
+              if (!project) {
+                project = database.createProject({ id: projectId, name, workspacePath: null, actor: actorFromRequest(request) });
+                created = true;
+              }
+              if (ownerUserId) {
+                database.upsertProjectMember(projectId, {
+                  userId: ownerUserId.slice(0, 96),
+                  userName: (ownerName ?? ownerUserId).slice(0, 120),
+                  userAvatarUrl: null,
+                  role: "manager",
+                });
+                project = database.getProject(projectId);
+              }
+              events.emit("project.member.updated", { projectId, project });
+              return { project, created };
+            });
             result = { project, created };
           } else if (toolName === "dashi_upsert_task") {
             assertWorkBuddyBridge(request);
@@ -2123,31 +2126,37 @@ export function createTaskboardServer(options = {}) {
               const reopenedForReview = current.status === "done" && (status === "todo" || status === "in_progress");
               if (status !== undefined && status !== current.status && !reopenedForReview) changes.status = status;
               if (Object.keys(changes).length > 0) {
-                task = database.updateTask(existingId, current.version, changes, undefined);
-                events.emit("task.updated", { task });
+                task = events.withTransaction(database, () => {
+                  const task = database.updateTask(existingId, current.version, changes, undefined);
+                  events.emit("task.updated", { task });
+                  return task;
+                });
               } else {
                 task = current;
               }
               result = { task, created: false };
             } else {
-              task = database.createTask({
-                projectId,
-                title,
-                description: description ?? "",
-                status: status ?? "todo",
-                priority: "medium",
-                labels: ["workbuddy"],
-                threadId,
-                workflowId: null,
-                developmentContext: null,
-                dueDate: null,
-                recurrence: null,
-                actor,
-                assignee: assigneeName
-                  ? { type: "user", id: `workbuddy:${assigneeName}`, name: assigneeName, avatarUrl: null }
-                  : actor,
+              task = events.withTransaction(database, () => {
+                const task = database.createTask({
+                  projectId,
+                  title,
+                  description: description ?? "",
+                  status: status ?? "todo",
+                  priority: "medium",
+                  labels: ["workbuddy"],
+                  threadId,
+                  workflowId: null,
+                  developmentContext: null,
+                  dueDate: null,
+                  recurrence: null,
+                  actor,
+                  assignee: assigneeName
+                    ? { type: "user", id: `workbuddy:${assigneeName}`, name: assigneeName, avatarUrl: null }
+                    : actor,
+                });
+                events.emit("task.created", { task });
+                return task;
               });
-              events.emit("task.created", { task });
               result = { task, created: true };
             }
           } else if (toolName === "dashi_agent_register") {
@@ -2192,15 +2201,18 @@ export function createTaskboardServer(options = {}) {
             if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 16) {
               throw new ApiError(400, "INVALID_FIELD", "'concurrency' must be an integer between 1 and 16");
             }
-            const agent = database.upsertAgent({
-              id: explicitId ?? username,
-              name: stringField(args.name, "name", { required: true, maxLength: 120 }),
-              device: binding?.device ?? (stringField(args.device ?? "", "device", { required: false, maxLength: 120 }) ?? ""),
-              capabilities: binding?.capabilities ?? capabilities,
-              projects: binding?.projects ?? projects,
-              concurrency,
+            const agent = events.withTransaction(database, () => {
+              const agent = database.upsertAgent({
+                id: explicitId ?? username,
+                name: stringField(args.name, "name", { required: true, maxLength: 120 }),
+                device: binding?.device ?? (stringField(args.device ?? "", "device", { required: false, maxLength: 120 }) ?? ""),
+                capabilities: binding?.capabilities ?? capabilities,
+                projects: binding?.projects ?? projects,
+                concurrency,
+              });
+              events.emit("agent.registered", { agent });
+              return agent;
             });
-            events.emit("agent.registered", { agent });
             result = { agent };
           } else if (toolName === "dashi_agent_heartbeat") {
             const username = agentUsernameFromActor(actorFromRequest(request));
@@ -2295,8 +2307,11 @@ export function createTaskboardServer(options = {}) {
             const renewTarget = database.getTask(taskId);
             if (!renewTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
             assertAgentProjectScope(database, actorFromRequest(request), renewTarget.projectId);
-            const lease = database.renewTaskLease(taskId, username, leaseSeconds);
-            events.emit("task.lease.renewed", { taskId, lease });
+            const lease = events.withTransaction(database, () => {
+              const lease = database.renewTaskLease(taskId, username, leaseSeconds);
+              events.emit("task.lease.renewed", { taskId, lease });
+              return lease;
+            });
             result = { lease };
           } else if (toolName === "dashi_release_task") {
             const username = agentUsernameFromActor(actorFromRequest(request));
@@ -2620,11 +2635,15 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "POST") {
           assertAdmin(request);
-          const project = database.createProject({
-            ...parseProjectCreate(await readJson(request)),
-            actor: actorFromRequest(request),
+          const body = parseProjectCreate(await readJson(request));
+          const project = events.withTransaction(database, () => {
+            const project = database.createProject({
+              ...body,
+              actor: actorFromRequest(request),
+            });
+            events.emit("project.created", { project });
+            return project;
           });
-          events.emit("project.created", { project });
           return sendJson(response, 201, { project });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
@@ -2649,13 +2668,20 @@ export function createTaskboardServer(options = {}) {
         }
         assertProjectAdmin(request, database, projectId);
         if (!userId && request.method === "POST") {
-          const member = database.upsertProjectMember(projectId, parseProjectMember(await readJson(request)));
-          events.emit("project.member.updated", { projectId, member });
+          const body = parseProjectMember(await readJson(request));
+          const member = events.withTransaction(database, () => {
+            const member = database.upsertProjectMember(projectId, body);
+            events.emit("project.member.updated", { projectId, member });
+            return member;
+          });
           return sendJson(response, 200, { member });
         }
         if (userId && request.method === "DELETE") {
-          const member = database.removeProjectMember(projectId, userId);
-          events.emit("project.member.removed", { projectId, member });
+          const member = events.withTransaction(database, () => {
+            const member = database.removeProjectMember(projectId, userId);
+            events.emit("project.member.removed", { projectId, member });
+            return member;
+          });
           return sendEmpty(response, 204);
         }
         return methodNotAllowed(response, userId ? ["DELETE"] : ["GET", "POST"]);
@@ -2715,10 +2741,13 @@ export function createTaskboardServer(options = {}) {
         }
         validateProjectId(projectId);
         const { version } = parseArchive(await readJson(request));
-        const project = projectVisibilityRoute[2] === "hide"
-          ? database.hideProject(projectId, version)
-          : database.restoreProject(projectId, version);
-        events.emit(projectVisibilityRoute[2] === "hide" ? "project.hidden" : "project.restored", { project });
+        const project = events.withTransaction(database, () => {
+          const project = projectVisibilityRoute[2] === "hide"
+            ? database.hideProject(projectId, version)
+            : database.restoreProject(projectId, version);
+          events.emit(projectVisibilityRoute[2] === "hide" ? "project.hidden" : "project.restored", { project });
+          return project;
+        });
         return sendJson(response, 200, { project });
       }
 
@@ -2739,10 +2768,13 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "PUT") {
           const input = parseWorkflowWorkspaceSave(await readJson(request));
-          const workflow = database.saveWorkflowWorkspace(projectId, input.version, input.workspace);
-          events.emit("workflow.updated", {
-            projectId,
-            workflowVersion: workflow.version,
+          const workflow = events.withTransaction(database, () => {
+            const workflow = database.saveWorkflowWorkspace(projectId, input.version, input.workspace);
+            events.emit("workflow.updated", {
+              projectId,
+              workflowVersion: workflow.version,
+            });
+            return workflow;
           });
           return sendJson(response, 200, { workflow });
         }
@@ -2812,12 +2844,15 @@ export function createTaskboardServer(options = {}) {
           const { assigneeTarget, ...input } = parseTaskCreate(await readJson(request));
           assertProjectAccess(request, database, input.projectId);
           if (input.status === "done") assertProjectAdmin(request, database, input.projectId);
-          const task = database.createTask({
-            ...input,
-            actor,
-            assignee: resolveAssignee(assigneeTarget, actor),
+          const task = events.withTransaction(database, () => {
+            const task = database.createTask({
+              ...input,
+              actor,
+              assignee: resolveAssignee(assigneeTarget, actor),
+            });
+            events.emit("task.created", { task });
+            return task;
           });
-          events.emit("task.created", { task });
           return sendJson(response, 201, { task });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
@@ -2863,26 +2898,32 @@ export function createTaskboardServer(options = {}) {
         const relationType = parseIssueRelationType(type);
         if (request.method === "POST") {
           const { version, threadId } = parseArchive(await readJson(request));
-          const result = database.addTaskRelation(
-            taskId,
-            version,
-            relationType,
-            relatedTaskId,
-            threadId,
-          );
-          events.emit("task.relation.updated", result);
+          const result = events.withTransaction(database, () => {
+            const result = database.addTaskRelation(
+              taskId,
+              version,
+              relationType,
+              relatedTaskId,
+              threadId,
+            );
+            events.emit("task.relation.updated", result);
+            return result;
+          });
           return sendJson(response, 200, result);
         }
         if (request.method === "DELETE") {
           const { version, threadId } = parseArchive(await readJson(request));
-          const result = database.removeTaskRelation(
-            taskId,
-            version,
-            relationType,
-            relatedTaskId,
-            threadId,
-          );
-          events.emit("task.relation.updated", result);
+          const result = events.withTransaction(database, () => {
+            const result = database.removeTaskRelation(
+              taskId,
+              version,
+              relationType,
+              relatedTaskId,
+              threadId,
+            );
+            events.emit("task.relation.updated", result);
+            return result;
+          });
           return sendJson(response, 200, result);
         }
         return methodNotAllowed(response, ["POST", "DELETE"]);
@@ -2938,14 +2979,22 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "PATCH") {
           const patch = parseCommentPatch(await readJson(request));
-          const comment = database.updateComment(id, patch.version, patch.body, patch.threadId);
-          const task = database.getTask(comment.taskId);
-          events.emit("comment.updated", { comment, task });
+          const comment = events.withTransaction(database, () => {
+            const comment = database.updateComment(id, patch.version, patch.body, patch.threadId);
+            const task = database.getTask(comment.taskId);
+            events.emit("comment.updated", { comment, task });
+            return comment;
+          });
           return sendJson(response, 200, { comment });
         }
         if (request.method === "DELETE") {
           const { version } = parseArchive(await readJson(request));
-          const comment = database.deleteComment(id, version);
+          const comment = events.withTransaction(database, () => {
+            const comment = database.deleteComment(id, version);
+            const task = database.getTask(comment.taskId);
+            events.emit("comment.deleted", { comment, task });
+            return comment;
+          });
           for (const attachment of comment.attachments) {
             try {
               await unlink(path.join(resolved.attachmentsDirectory, attachment.id));
@@ -2953,8 +3002,6 @@ export function createTaskboardServer(options = {}) {
               if (error.code !== "ENOENT") throw error;
             }
           }
-          const task = database.getTask(comment.taskId);
-          events.emit("comment.deleted", { comment, task });
           return sendEmpty(response, 204);
         }
         return methodNotAllowed(response, ["PATCH", "DELETE"]);
@@ -2988,13 +3035,16 @@ export function createTaskboardServer(options = {}) {
           await writeFile(storagePath, body, { flag: "wx" });
           let attachment;
           try {
-            attachment = database.createCommentAttachment(commentId, { id, ...metadata, size: body.length });
+            attachment = events.withTransaction(database, () => {
+              const attachment = database.createCommentAttachment(commentId, { id, ...metadata, size: body.length });
+              const task = database.getTask(comment.taskId);
+              events.emit("attachment.created", { attachment, comment: database.getComment(commentId), task });
+              return attachment;
+            });
           } catch (error) {
             await unlink(storagePath);
             throw error;
           }
-          const task = database.getTask(comment.taskId);
-          events.emit("attachment.created", { attachment, comment: database.getComment(commentId), task });
           return sendJson(response, 201, { attachment });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
@@ -3028,12 +3078,15 @@ export function createTaskboardServer(options = {}) {
           await writeFile(storagePath, body, { flag: "wx" });
           let attachment;
           try {
-            attachment = database.createAttachment(taskId, { id, ...metadata, size: body.length });
+            attachment = events.withTransaction(database, () => {
+              const attachment = database.createAttachment(taskId, { id, ...metadata, size: body.length });
+              events.emit("attachment.created", { attachment, task });
+              return attachment;
+            });
           } catch (error) {
             await unlink(storagePath);
             throw error;
           }
-          events.emit("attachment.created", { attachment, task });
           return sendJson(response, 201, { attachment });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
@@ -3091,14 +3144,16 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "DELETE") return methodNotAllowed(response, ["DELETE"]);
         const attachment = database.getAttachment(id);
         if (!attachment) throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
+        events.withTransaction(database, () => {
+          database.deleteAttachment(id);
+          const task = database.getTask(attachment.taskId);
+          events.emit("attachment.deleted", { attachment, task });
+        });
         try {
           await unlink(path.join(resolved.attachmentsDirectory, attachment.id));
         } catch (error) {
           if (error.code !== "ENOENT") throw error;
         }
-        database.deleteAttachment(id);
-        const task = database.getTask(attachment.taskId);
-        events.emit("attachment.deleted", { attachment, task });
         return sendEmpty(response, 204);
       }
 
@@ -3130,8 +3185,11 @@ export function createTaskboardServer(options = {}) {
           if (assigneeTarget !== undefined) {
             changes.assignee = resolveAssignee(assigneeTarget, actorFromRequest(request));
           }
-          const task = database.updateTask(id, version, changes, threadId);
-          events.emit("task.updated", { task });
+          const task = events.withTransaction(database, () => {
+            const task = database.updateTask(id, version, changes, threadId);
+            events.emit("task.updated", { task });
+            return task;
+          });
           return sendJson(response, 200, { task });
         }
         if (action === "move" && request.method === "POST") {
@@ -3139,8 +3197,11 @@ export function createTaskboardServer(options = {}) {
           const currentTask = database.getTask(id);
           if (!currentTask) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
           if (move.status === "done") assertProjectAdmin(request, database, currentTask.projectId);
-          const task = database.moveTask(id, move.version, move.status, move.sortOrder, move.threadId);
-          events.emit("task.moved", { task });
+          const task = events.withTransaction(database, () => {
+            const task = database.moveTask(id, move.version, move.status, move.sortOrder, move.threadId);
+            events.emit("task.moved", { task });
+            return task;
+          });
           return sendJson(response, 200, { task });
         }
         if (action === "review" && request.method === "POST") {
@@ -3180,14 +3241,20 @@ export function createTaskboardServer(options = {}) {
         }
         if (action === "archive" && request.method === "POST") {
           const { version, threadId } = parseArchive(await readJson(request));
-          const task = database.archiveTask(id, version, threadId);
-          events.emit("task.archived", { task });
+          const task = events.withTransaction(database, () => {
+            const task = database.archiveTask(id, version, threadId);
+            events.emit("task.archived", { task });
+            return task;
+          });
           return sendJson(response, 200, { task });
         }
         if (action === "restore" && request.method === "POST") {
           const { version, threadId } = parseArchive(await readJson(request));
-          const task = database.restoreTask(id, version, threadId);
-          events.emit("task.restored", { task });
+          const task = events.withTransaction(database, () => {
+            const task = database.restoreTask(id, version, threadId);
+            events.emit("task.restored", { task });
+            return task;
+          });
           return sendJson(response, 200, { task });
         }
         return methodNotAllowed(response, action ? ["POST"] : ["GET", "PATCH"]);

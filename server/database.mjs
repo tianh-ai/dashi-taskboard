@@ -239,24 +239,38 @@ export class TaskboardDatabase {
 
   // 嵌套安全的事务原语：最外层 BEGIN/COMMIT/ROLLBACK，嵌套层自动降级为 SAVEPOINT。
   // 业务写入与 outbox 追加必须同事务：崩溃窗口内要么同时可见，要么同时回滚。
+  // 深度只在 SQL 成功后调整：COMMIT 因磁盘满等 I/O 错误抛出时深度保持不变，
+  // 由随后的 rollback 路径一次性归位，绝不允许出现负深度（dashi_sp_-1）。
   #beginImmediate() {
+    this.#assertTransactionHealthy();
     if (this.#transactionDepth === 0) this.database.exec("BEGIN IMMEDIATE");
     else this.database.exec(`SAVEPOINT dashi_sp_${this.#transactionDepth}`);
     this.#transactionDepth += 1;
   }
 
   #commitImmediate() {
-    this.#transactionDepth -= 1;
-    if (this.#transactionDepth === 0) this.database.exec("COMMIT");
-    else this.database.exec(`RELEASE SAVEPOINT dashi_sp_${this.#transactionDepth}`);
+    const depth = this.#transactionDepth - 1;
+    if (depth === 0) this.database.exec("COMMIT");
+    else this.database.exec(`RELEASE SAVEPOINT dashi_sp_${depth}`);
+    this.#transactionDepth = depth;
   }
 
   #rollbackImmediate() {
-    this.#transactionDepth -= 1;
-    if (this.#transactionDepth === 0) this.database.exec("ROLLBACK");
+    const depth = this.#transactionDepth - 1;
+    if (depth < 0) {
+      // 无匹配的 BEGIN：不改动深度，尽力回滚并保留原始异常给调用方。
+      try {
+        this.database.exec("ROLLBACK");
+      } catch {
+        // 连接已无活动事务时忽略，让原始错误向上传播。
+      }
+      return;
+    }
+    if (depth === 0) this.database.exec("ROLLBACK");
     else this.database.exec(
-      `ROLLBACK TO SAVEPOINT dashi_sp_${this.#transactionDepth}; RELEASE SAVEPOINT dashi_sp_${this.#transactionDepth}`,
+      `ROLLBACK TO SAVEPOINT dashi_sp_${depth}; RELEASE SAVEPOINT dashi_sp_${depth}`,
     );
+    this.#transactionDepth = depth;
   }
 
   transaction(fn) {
@@ -266,8 +280,24 @@ export class TaskboardDatabase {
       this.#commitImmediate();
       return result;
     } catch (error) {
-      this.#rollbackImmediate();
+      try {
+        this.#rollbackImmediate();
+      } catch (rollbackError) {
+        // 回滚失败不得掩盖业务原始异常；连接事务状态已不可信，标记熔断。
+        this.#transactionDepth = 0;
+        this.#transactionBroken = true;
+        error.rollbackError = rollbackError;
+      }
       throw error;
+    }
+  }
+
+  // 熔断保护：事务回滚失败后连接的事务状态不可信，拒绝后续写事务直到重建连接。
+  #transactionBroken = false;
+
+  #assertTransactionHealthy() {
+    if (this.#transactionBroken) {
+      throw new Error("TaskboardDatabase transaction state is broken; restart the process or reopen the database");
     }
   }
 

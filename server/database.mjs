@@ -235,6 +235,42 @@ export class TaskboardDatabase {
     this.interruptAbandonedAiChatRuns();
   }
 
+  #transactionDepth = 0;
+
+  // 嵌套安全的事务原语：最外层 BEGIN/COMMIT/ROLLBACK，嵌套层自动降级为 SAVEPOINT。
+  // 业务写入与 outbox 追加必须同事务：崩溃窗口内要么同时可见，要么同时回滚。
+  #beginImmediate() {
+    if (this.#transactionDepth === 0) this.database.exec("BEGIN IMMEDIATE");
+    else this.database.exec(`SAVEPOINT dashi_sp_${this.#transactionDepth}`);
+    this.#transactionDepth += 1;
+  }
+
+  #commitImmediate() {
+    this.#transactionDepth -= 1;
+    if (this.#transactionDepth === 0) this.database.exec("COMMIT");
+    else this.database.exec(`RELEASE SAVEPOINT dashi_sp_${this.#transactionDepth}`);
+  }
+
+  #rollbackImmediate() {
+    this.#transactionDepth -= 1;
+    if (this.#transactionDepth === 0) this.database.exec("ROLLBACK");
+    else this.database.exec(
+      `ROLLBACK TO SAVEPOINT dashi_sp_${this.#transactionDepth}; RELEASE SAVEPOINT dashi_sp_${this.#transactionDepth}`,
+    );
+  }
+
+  transaction(fn) {
+    this.#beginImmediate();
+    try {
+      const result = fn();
+      this.#commitImmediate();
+      return result;
+    } catch (error) {
+      this.#rollbackImmediate();
+      throw error;
+    }
+  }
+
   #migrate() {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS projects (
@@ -616,15 +652,15 @@ export class TaskboardDatabase {
       ["assignee_avatar_url", "TEXT", "creator_avatar_url"],
     ].filter(([column]) => !identityTaskColumns.some((current) => current.name === column));
     if (assigneeMigrations.length > 0) {
-      this.database.exec("BEGIN IMMEDIATE");
+      this.#beginImmediate();
       try {
         for (const [column, definition, source] of assigneeMigrations) {
           this.database.exec(`ALTER TABLE tasks ADD COLUMN ${column} ${definition}`);
           this.database.exec(`UPDATE tasks SET ${column} = ${source}`);
         }
-        this.database.exec("COMMIT");
+        this.#commitImmediate();
       } catch (error) {
-        this.database.exec("ROLLBACK");
+        this.#rollbackImmediate();
         throw error;
       }
     }
@@ -727,7 +763,7 @@ export class TaskboardDatabase {
 
   consumeWeComOAuthState(state, agentId) {
     const timestamp = now();
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       const row = this.database.prepare(`
         SELECT state, agent_id, expires_at
@@ -736,10 +772,10 @@ export class TaskboardDatabase {
       `).get(state);
       this.database.prepare("DELETE FROM wecom_oauth_states WHERE state = ?").run(state);
       this.database.prepare("DELETE FROM wecom_oauth_states WHERE expires_at <= ?").run(timestamp);
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
       return Boolean(row && row.agent_id === agentId && row.expires_at > timestamp);
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
   }
@@ -822,7 +858,7 @@ export class TaskboardDatabase {
 
   syncDeviceProjects(device, projects) {
     const timestamp = now();
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       this.database.prepare(`
         INSERT INTO devices (
@@ -911,16 +947,16 @@ export class TaskboardDatabase {
           WHERE device_id = ? AND codex_project_id NOT IN (${placeholders})
         `).run(device.id, ...seenCodexProjectIds);
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
   }
 
   syncDeviceThreads(device, threads) {
     const timestamp = now();
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       this.database.prepare(`
         UPDATE devices
@@ -1067,9 +1103,9 @@ export class TaskboardDatabase {
             last_seen_at = excluded.last_seen_at
         `).run(taskId, device.id, thread.id, thread.projectId, timestamp);
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
   }
@@ -1126,7 +1162,8 @@ export class TaskboardDatabase {
       return;
     }
 
-    this.database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+    this.database.exec("PRAGMA foreign_keys = OFF");
+    this.#beginImmediate();
     try {
       this.database.exec(`
         CREATE TABLE tasks_status_migration (
@@ -1170,9 +1207,9 @@ export class TaskboardDatabase {
         DROP TABLE tasks;
         ALTER TABLE tasks_status_migration RENAME TO tasks;
       `);
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     } finally {
       this.database.exec("PRAGMA foreign_keys = ON");
@@ -1222,7 +1259,7 @@ export class TaskboardDatabase {
 
   createProject(input) {
     const timestamp = now();
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       this.database.prepare(`
         INSERT INTO projects (id, name, workspace_path, next_task_number, created_at, updated_at)
@@ -1242,9 +1279,9 @@ export class TaskboardDatabase {
           timestamp,
         );
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       if (String(error.message).includes("UNIQUE constraint failed")) {
         throw new ApiError(409, "PROJECT_EXISTS", `Project '${input.id}' already exists`);
       }
@@ -1589,8 +1626,7 @@ export class TaskboardDatabase {
     }
     // 领取是两段写（任务置 in_progress + 写租约），必须同一事务：
     // 否则崩溃窗口留下无租约的 in_progress 任务，多进程下可双领取。
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
+    return this.transaction(() => {
       const result = this.database.prepare(`
         UPDATE tasks SET
           status = 'in_progress',
@@ -1623,22 +1659,18 @@ export class TaskboardDatabase {
           renewed_at = excluded.renewed_at,
           expires_at = excluded.expires_at
       `).run(taskId, agentId, timestamp, timestamp, expiresAt);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      this.database.exec("ROLLBACK");
-      throw error;
-    }
-    return {
-      task: this.getTask(taskId),
-      lease: this.getTaskLease(taskId),
-      tookOver: Boolean(
-        previousLease
-        && previousLease.agentId !== agentId
-        && previousLease.expiresAt <= timestamp,
-      ),
-      previousAgentId: previousLease?.agentId ?? null,
-      replayed: false,
-    };
+      return {
+        task: this.getTask(taskId),
+        lease: this.getTaskLease(taskId),
+        tookOver: Boolean(
+          previousLease
+          && previousLease.agentId !== agentId
+          && previousLease.expiresAt <= timestamp,
+        ),
+        previousAgentId: previousLease?.agentId ?? null,
+        replayed: false,
+      };
+    });
   }
 
   renewTaskLease(taskId, agentId, leaseSeconds) {
@@ -1692,8 +1724,7 @@ export class TaskboardDatabase {
     if (!lease || lease.agentId !== agentId || lease.expiresAt <= timestamp) {
       throw new ApiError(409, "LEASE_NOT_HELD", `Task '${task.id}' is not actively leased by agent '${agentId}'`);
     }
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
+    return this.transaction(() => {
       const result = this.database.prepare(`
         UPDATE tasks
         SET status = 'in_review', version = version + 1, updated_at = ?
@@ -1703,12 +1734,8 @@ export class TaskboardDatabase {
       this.database.prepare(`
         DELETE FROM task_leases WHERE task_id = ? AND agent_id = ?
       `).run(task.id, agentId);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      this.database.exec("ROLLBACK");
-      throw error;
-    }
-    return this.getTask(task.id);
+      return this.getTask(task.id);
+    });
   }
 
   getProject(id) {
@@ -1800,7 +1827,7 @@ export class TaskboardDatabase {
 
   saveWorkflowWorkspace(projectId, expectedVersion, workspace) {
     const timestamp = now();
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       if (!this.database.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
@@ -1827,9 +1854,9 @@ export class TaskboardDatabase {
           VALUES (?, ?, 1, ?)
         `).run(projectId, JSON.stringify(workspace), timestamp);
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
     return this.getWorkflowWorkspace(projectId);
@@ -1931,7 +1958,7 @@ export class TaskboardDatabase {
   createAiChatRun(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.startedAt ?? now();
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       this.database.prepare(`
         INSERT INTO ai_chat_runs (
@@ -1953,9 +1980,9 @@ export class TaskboardDatabase {
           WHERE id = ?
         `).run(timestamp, input.threadId);
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
     return this.getAiChatRun(id);
@@ -1981,7 +2008,7 @@ export class TaskboardDatabase {
     }
     if (assignments.length === 0) return current;
 
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       values.push(id);
       this.database.prepare(`
@@ -2000,9 +2027,9 @@ export class TaskboardDatabase {
             )
         `).run(threadStatus, changes.finishedAt ?? now(), current.threadId, current.threadId);
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
     return this.getAiChatRun(id);
@@ -2039,7 +2066,7 @@ export class TaskboardDatabase {
 
   interruptAbandonedAiChatRuns() {
     const timestamp = now();
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       const result = this.database.prepare(`
         UPDATE ai_chat_runs
@@ -2061,10 +2088,10 @@ export class TaskboardDatabase {
             )
         `).run(timestamp);
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
       return Number(result.changes);
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
   }
@@ -2117,7 +2144,7 @@ export class TaskboardDatabase {
   }
 
   createTask(input) {
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       const project = this.database.prepare(`
         SELECT id, next_task_number FROM projects WHERE id = ?
@@ -2181,10 +2208,10 @@ export class TaskboardDatabase {
         timestamp,
         timestamp,
       );
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
       return this.getTask(id);
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
   }
@@ -2245,7 +2272,7 @@ export class TaskboardDatabase {
     const timestamp = now();
     values.push(timestamp, current.id, version);
 
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       const result = this.database.prepare(`
         UPDATE tasks SET ${assignments.join(", ")} WHERE id = ? AND version = ?
@@ -2253,9 +2280,9 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
     return this.getTask(current.id);
@@ -2277,7 +2304,7 @@ export class TaskboardDatabase {
     }
 
     const timestamp = now();
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       const result = this.database.prepare(`
         UPDATE tasks
@@ -2287,9 +2314,9 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
     return this.getTask(current.id);
@@ -2307,8 +2334,7 @@ export class TaskboardDatabase {
     const status = decision === "approved" ? "done" : "in_progress";
     const timestamp = now();
     const reviewId = randomUUID();
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
+    return this.transaction(() => {
       this.database.prepare(`
         INSERT INTO task_reviews (
           id, task_id, decision, note, reviewer_type, reviewer_id,
@@ -2331,19 +2357,15 @@ export class TaskboardDatabase {
         WHERE id = ? AND version = ?
       `).run(status, timestamp, current.id, version);
       if (result.changes !== 1) this.#throwMissingOrConflict(id, version);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      this.database.exec("ROLLBACK");
-      throw error;
-    }
-    return this.getTask(current.id);
+      return this.getTask(current.id);
+    });
   }
 
   archiveTask(id, version, threadId) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     const timestamp = now();
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       const result = this.database.prepare(`
         UPDATE tasks
@@ -2353,9 +2375,9 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
     return this.getTask(current.id);
@@ -2368,7 +2390,7 @@ export class TaskboardDatabase {
       throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be restored");
     }
     const timestamp = now();
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       const result = this.database.prepare(`
         UPDATE tasks
@@ -2378,16 +2400,16 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
     return this.getTask(current.id);
   }
 
   addTaskRelation(id, version, type, relatedId, threadId) {
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       const task = this.#requireTask(id);
       const relatedTask = this.#requireTask(relatedId);
@@ -2432,19 +2454,19 @@ export class TaskboardDatabase {
         ) VALUES (?, ?, ?, ?)
       `).run(relationType, sourceTaskId, targetTaskId, now());
       this.#touchTask(task.id, version, threadId);
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
       return {
         task: this.getTask(task.id),
         relatedTask: this.getTask(relatedTask.id),
       };
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
   }
 
   removeTaskRelation(id, version, type, relatedId, threadId) {
-    this.database.exec("BEGIN IMMEDIATE");
+    this.#beginImmediate();
     try {
       const task = this.#requireTask(id);
       const relatedTask = this.#requireTask(relatedId);
@@ -2463,13 +2485,13 @@ export class TaskboardDatabase {
         throw new ApiError(404, "RELATION_NOT_FOUND", "This issue relation does not exist");
       }
       this.#touchTask(task.id, version, threadId);
-      this.database.exec("COMMIT");
+      this.#commitImmediate();
       return {
         task: this.getTask(task.id),
         relatedTask: this.getTask(relatedTask.id),
       };
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.#rollbackImmediate();
       throw error;
     }
   }

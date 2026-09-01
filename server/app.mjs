@@ -1968,12 +1968,15 @@ export function createTaskboardServer(options = {}) {
             const task = database.getTask(taskId);
             if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
             assertAgentProjectScope(database, actorFromRequest(request), task.projectId);
-            const comment = database.createComment(taskId, {
-              body,
-              actor: resolveAgentAuthor(database, actorFromRequest(request)),
+            const comment = database.transaction(() => {
+              const created = database.createComment(taskId, {
+                body,
+                actor: resolveAgentAuthor(database, actorFromRequest(request)),
+              });
+              events.emit("comment.created", { comment: created, task });
+              dispatchCommentMentions(database, events, task, created);
+              return created;
             });
-            events.emit("comment.created", { comment, task });
-            dispatchCommentMentions(database, events, task, comment);
             result = { comment, task };
           } else if (toolName === "dashi_list_project_messages") {
             const projectId = stringField(args.projectId, "projectId", { required: true, maxLength: 64 });
@@ -2014,14 +2017,17 @@ export function createTaskboardServer(options = {}) {
             if (authorUserId && !database.getProjectMembership(projectId, authorUserId)) {
               throw new ApiError(403, "PROJECT_ACCESS_DENIED", "WorkBuddy 发言人不是此项目成员");
             }
-            const projectMessage = database.createProjectMessage(projectId, {
-              ...input,
-              actor: authorUserId
-                ? { type: "user", id: authorUserId, name: authorName, avatarUrl: null }
-                : resolveAgentAuthor(database, actorFromRequest(request)),
+            const projectMessage = database.transaction(() => {
+              const message = database.createProjectMessage(projectId, {
+                ...input,
+                actor: authorUserId
+                  ? { type: "user", id: authorUserId, name: authorName, avatarUrl: null }
+                  : resolveAgentAuthor(database, actorFromRequest(request)),
+              });
+              events.emit("project.message.created", { projectId, message });
+              dispatchAgentMentions(database, events, projectId, message);
+              return message;
             });
-            events.emit("project.message.created", { projectId, message: projectMessage });
-            dispatchAgentMentions(database, events, projectId, projectMessage);
             result = { message: projectMessage };
           } else if (toolName === "dashi_submit_for_review") {
             const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
@@ -2032,8 +2038,11 @@ export function createTaskboardServer(options = {}) {
             const reviewTarget = database.getTask(taskId);
             if (!reviewTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
             assertAgentProjectScope(database, actorFromRequest(request), reviewTarget.projectId);
-            const task = database.submitClaimedTaskForReview(taskId, username, parseVersion(args.version));
-            events.emit("task.moved", { task });
+            const task = database.transaction(() => {
+              const submitted = database.submitClaimedTaskForReview(taskId, username, parseVersion(args.version));
+              events.emit("task.moved", { task: submitted });
+              return submitted;
+            });
             result = { task };
           } else if (toolName === "dashi_upsert_project") {
             assertWorkBuddyBridge(request);
@@ -2225,28 +2234,31 @@ export function createTaskboardServer(options = {}) {
             const claimTarget = database.getTask(taskId);
             if (!claimTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
             assertAgentProjectScope(database, actorFromRequest(request), claimTarget.projectId);
-            const claim = database.claimTask(taskId, username, leaseSeconds);
-            const agent = database.getAgent(username);
-            const agentLabel = agent.device ? `${agent.name}·${agent.device}` : agent.name;
-            if (!claim.replayed) {
-              agentSystemMessage(
-                database,
-                events,
-                claim.task.projectId,
-                claim.tookOver
-                  ? `【接管】${agentLabel} 接管任务「${claim.task.title}」（原执行者 ${claim.previousAgentId} 租约已超时）`
-                  : `【领取】${agentLabel} 领取任务「${claim.task.title}」，租约至 ${claim.lease.expiresAt}`,
-                taskId,
-              );
-              events.emit("task.claimed", { task: claim.task, lease: claim.lease, agentId: username });
-              database.appendIntegrationEvent("workbuddy", {
-                type: "task.claimed",
-                projectId: claim.task.projectId,
-                taskId,
-                agent: { id: username, name: agent.name, device: agent.device },
-                tookOver: claim.tookOver,
-              });
-            }
+            const claim = database.transaction(() => {
+              const claimed = database.claimTask(taskId, username, leaseSeconds);
+              if (!claimed.replayed) {
+                const agent = database.getAgent(username);
+                const agentLabel = agent.device ? `${agent.name}·${agent.device}` : agent.name;
+                agentSystemMessage(
+                  database,
+                  events,
+                  claimed.task.projectId,
+                  claimed.tookOver
+                    ? `【接管】${agentLabel} 接管任务「${claimed.task.title}」（原执行者 ${claimed.previousAgentId} 租约已超时）`
+                    : `【领取】${agentLabel} 领取任务「${claimed.task.title}」，租约至 ${claimed.lease.expiresAt}`,
+                  taskId,
+                );
+                events.emit("task.claimed", { task: claimed.task, lease: claimed.lease, agentId: username });
+                database.appendIntegrationEvent("workbuddy", {
+                  type: "task.claimed",
+                  projectId: claimed.task.projectId,
+                  taskId,
+                  agent: { id: username, name: agent.name, device: agent.device },
+                  tookOver: claimed.tookOver,
+                });
+              }
+              return claimed;
+            });
             result = claim;
           } else if (toolName === "dashi_renew_task_lease") {
             const username = agentUsernameFromActor(actorFromRequest(request));
@@ -2267,19 +2279,22 @@ export function createTaskboardServer(options = {}) {
             const releaseTarget = database.getTask(taskId);
             if (!releaseTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
             assertAgentProjectScope(database, actorFromRequest(request), releaseTarget.projectId);
-            const task = database.releaseTask(taskId, username, { returnToStatus: "todo" });
-            const agent = database.getAgent(username);
-            if (task) {
-              const agentLabel = agent ? (agent.device ? `${agent.name}·${agent.device}` : agent.name) : username;
-              agentSystemMessage(
-                database,
-                events,
-                task.projectId,
-                `【释放】${agentLabel} 释放任务「${task.title}」${reason ? `：${reason}` : ""}，任务回到可领取状态`,
-                taskId,
-              );
-            }
-            events.emit("task.released", { task, agentId: username });
+            const task = database.transaction(() => {
+              const released = database.releaseTask(taskId, username, { returnToStatus: "todo" });
+              const agent = database.getAgent(username);
+              if (released) {
+                const agentLabel = agent ? (agent.device ? `${agent.name}·${agent.device}` : agent.name) : username;
+                agentSystemMessage(
+                  database,
+                  events,
+                  released.projectId,
+                  `【释放】${agentLabel} 释放任务「${released.title}」${reason ? `：${reason}` : ""}，任务回到可领取状态`,
+                  taskId,
+                );
+              }
+              events.emit("task.released", { task: released, agentId: username });
+              return released;
+            });
             result = { task };
           } else {
             return sendJson(response, 200, {
@@ -2645,12 +2660,15 @@ export function createTaskboardServer(options = {}) {
         if (request.method === "POST") {
           assertNoQuery(url.searchParams, "POST project message");
           const input = parseProjectMessage(await readJson(request));
-          const message = database.createProjectMessage(projectId, {
-            ...input,
-            actor: resolveAgentAuthor(database, actorFromRequest(request)),
+          const message = database.transaction(() => {
+            const created = database.createProjectMessage(projectId, {
+              ...input,
+              actor: resolveAgentAuthor(database, actorFromRequest(request)),
+            });
+            events.emit("project.message.created", { projectId, message: created });
+            dispatchAgentMentions(database, events, projectId, created);
+            return created;
           });
-          events.emit("project.message.created", { projectId, message });
-          dispatchAgentMentions(database, events, projectId, message);
           return sendJson(response, 201, { message });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
@@ -2861,13 +2879,17 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { comments: database.listComments(taskId) });
         }
         if (request.method === "POST") {
-          const comment = database.createComment(taskId, {
-            ...parseCommentCreate(await readJson(request)),
-            actor: actorFromRequest(request),
+          const input = parseCommentCreate(await readJson(request));
+          const comment = database.transaction(() => {
+            const created = database.createComment(taskId, {
+              ...input,
+              actor: actorFromRequest(request),
+            });
+            const task = database.getTask(taskId);
+            events.emit("comment.created", { comment: created, task });
+            dispatchCommentMentions(database, events, task, created);
+            return created;
           });
-          const task = database.getTask(taskId);
-          events.emit("comment.created", { comment, task });
-          dispatchCommentMentions(database, events, task, comment);
           return sendJson(response, 201, { comment });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
@@ -3109,21 +3131,24 @@ export function createTaskboardServer(options = {}) {
           const note = body.note === undefined || body.note === null || body.note === ""
             ? null
             : stringField(body.note, "note", { required: true, maxLength: 4000 });
-          const task = database.reviewTask(id, version, decision, note, actorFromRequest(request));
-          events.emit("task.reviewed", { task, review: task.latestReview });
-          // 授权闭环：审批结果回传指派 agent，让它据此判断下一步（驳回→修改重提）。
-          if (task.assignee?.type === "agent") {
-            database.appendIntegrationEvent("agents", {
-              type: "agent.review",
-              projectId: task.projectId,
-              taskId: task.id,
-              decision,
-              note,
-              agentId: task.assignee.id,
-              taskTitle: task.title,
-              at: task.updatedAt,
-            });
-          }
+          const task = database.transaction(() => {
+            const reviewed = database.reviewTask(id, version, decision, note, actorFromRequest(request));
+            events.emit("task.reviewed", { task: reviewed, review: reviewed.latestReview });
+            // 授权闭环：审批结果回传指派 agent，让它据此判断下一步（驳回→修改重提）。
+            if (reviewed.assignee?.type === "agent") {
+              database.appendIntegrationEvent("agents", {
+                type: "agent.review",
+                projectId: reviewed.projectId,
+                taskId: reviewed.id,
+                decision,
+                note,
+                agentId: reviewed.assignee.id,
+                taskTitle: reviewed.title,
+                at: reviewed.updatedAt,
+              });
+            }
+            return reviewed;
+          });
           return sendJson(response, 200, { task });
         }
         if (action === "archive" && request.method === "POST") {

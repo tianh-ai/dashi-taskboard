@@ -147,6 +147,63 @@ test("群聊派发与 outbox 同事务：outbox 写失败时消息不落库", as
   rawDb.close();
 });
 
+test("回滚不产生幻影 SSE 事件：客户端不得看到未提交的 comment/message", async () => {
+  const { app, baseUrl } = await startServer();
+  const project = await rest(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "tx-sse", name: "SSE 幻影" },
+  });
+  assert.equal(project.status, 201);
+
+  // 订阅 SSE 并等待连接建立。
+  const sseResponse = await fetch(`${baseUrl}/api/events`);
+  const reader = sseResponse.body.getReader();
+  const decoder = new TextDecoder();
+  const seen = [];
+  const pump = (async () => {
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        const text = decoder.decode(chunk.value, { stream: true });
+        for (const line of text.split("\n")) {
+          if (line.startsWith("event: ")) seen.push(line.slice(7).trim());
+        }
+      }
+    } catch {
+      // 流关闭时正常退出。
+    }
+  })();
+  await reader.read();
+
+  const restore = injectOutboxFailure(app);
+  const failed = await rest(baseUrl, "/api/projects/tx-sse/messages", {
+    method: "POST",
+    body: { body: "@Agent 回滚窗口消息", kind: "message", mentions: ["agent"] },
+  });
+  restore();
+  assert.equal(failed.status, 500);
+
+  // 回滚后：SSE 流上不得出现 message/comment 派生事件。
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const phantom = seen.filter((type) => type.startsWith("project.message") || type.startsWith("comment"));
+  assert.equal(phantom.length, 0, `回滚后不得广播幻影事件，实际看到：${seen.join(", ")}`);
+
+  // 成功路径：正常提交后 SSE 必须照常广播（不能因缓冲而丢事件）。
+  const ok = await rest(baseUrl, "/api/projects/tx-sse/messages", {
+    method: "POST",
+    body: { body: "正常消息", kind: "message" },
+  });
+  assert.equal(ok.status, 201);
+  const deadline = Date.now() + 5000;
+  while (!seen.includes("project.message.created") && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(seen.includes("project.message.created"), "提交后必须广播真实事件");
+  await reader.cancel();
+  await pump;
+});
+
 test("嵌套事务：内层抛错时外层整体回滚且连接可继续使用", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "dashi-nested-tx-"));
   try {

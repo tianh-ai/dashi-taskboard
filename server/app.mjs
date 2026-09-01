@@ -1232,6 +1232,7 @@ class EventHub {
   constructor(onEmit = null) {
     this.clients = new Set();
     this.onEmit = onEmit;
+    this.deferred = null;
     this.keepAlive = setInterval(() => {
       for (const client of this.clients) client.response.write(": keep-alive\n\n");
     }, 20_000);
@@ -1262,7 +1263,33 @@ class EventHub {
       ...value,
       at: new Date().toISOString(),
     };
+    // outbox 追加必须留在事务内（与业务写同原子性）；SSE 广播在事务内只入队：
+    // 回滚时丢弃，避免客户端看到未提交的幻影事件；提交后才真正广播。
     this.onEmit?.(event);
+    if (this.deferred) {
+      this.deferred.push({ event, type });
+      return;
+    }
+    this.#broadcast(event, type);
+  }
+
+  // 事务边界内的 SSE 事件缓冲：COMMIT 后广播，ROLLBACK 后丢弃。
+  withTransaction(database, fn) {
+    this.deferred = [];
+    let result;
+    try {
+      result = database.transaction(fn);
+    } catch (error) {
+      this.deferred = null;
+      throw error;
+    }
+    const pending = this.deferred;
+    this.deferred = null;
+    for (const { event, type } of pending) this.#broadcast(event, type);
+    return result;
+  }
+
+  #broadcast(event, type) {
     const message = `event: ${type}\ndata: ${JSON.stringify(event)}\n\n`;
     for (const client of this.clients) {
       if (client.filter(event)) client.response.write(message);
@@ -1968,7 +1995,7 @@ export function createTaskboardServer(options = {}) {
             const task = database.getTask(taskId);
             if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
             assertAgentProjectScope(database, actorFromRequest(request), task.projectId);
-            const comment = database.transaction(() => {
+            const comment = events.withTransaction(database, () => {
               const created = database.createComment(taskId, {
                 body,
                 actor: resolveAgentAuthor(database, actorFromRequest(request)),
@@ -2017,7 +2044,7 @@ export function createTaskboardServer(options = {}) {
             if (authorUserId && !database.getProjectMembership(projectId, authorUserId)) {
               throw new ApiError(403, "PROJECT_ACCESS_DENIED", "WorkBuddy 发言人不是此项目成员");
             }
-            const projectMessage = database.transaction(() => {
+            const projectMessage = events.withTransaction(database, () => {
               const message = database.createProjectMessage(projectId, {
                 ...input,
                 actor: authorUserId
@@ -2038,7 +2065,7 @@ export function createTaskboardServer(options = {}) {
             const reviewTarget = database.getTask(taskId);
             if (!reviewTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
             assertAgentProjectScope(database, actorFromRequest(request), reviewTarget.projectId);
-            const task = database.transaction(() => {
+            const task = events.withTransaction(database, () => {
               const submitted = database.submitClaimedTaskForReview(taskId, username, parseVersion(args.version));
               events.emit("task.moved", { task: submitted });
               return submitted;
@@ -2234,7 +2261,7 @@ export function createTaskboardServer(options = {}) {
             const claimTarget = database.getTask(taskId);
             if (!claimTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
             assertAgentProjectScope(database, actorFromRequest(request), claimTarget.projectId);
-            const claim = database.transaction(() => {
+            const claim = events.withTransaction(database, () => {
               const claimed = database.claimTask(taskId, username, leaseSeconds);
               if (!claimed.replayed) {
                 const agent = database.getAgent(username);
@@ -2279,7 +2306,7 @@ export function createTaskboardServer(options = {}) {
             const releaseTarget = database.getTask(taskId);
             if (!releaseTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
             assertAgentProjectScope(database, actorFromRequest(request), releaseTarget.projectId);
-            const task = database.transaction(() => {
+            const task = events.withTransaction(database, () => {
               const released = database.releaseTask(taskId, username, { returnToStatus: "todo" });
               const agent = database.getAgent(username);
               if (released) {
@@ -2660,7 +2687,7 @@ export function createTaskboardServer(options = {}) {
         if (request.method === "POST") {
           assertNoQuery(url.searchParams, "POST project message");
           const input = parseProjectMessage(await readJson(request));
-          const message = database.transaction(() => {
+          const message = events.withTransaction(database, () => {
             const created = database.createProjectMessage(projectId, {
               ...input,
               actor: resolveAgentAuthor(database, actorFromRequest(request)),
@@ -2880,7 +2907,7 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "POST") {
           const input = parseCommentCreate(await readJson(request));
-          const comment = database.transaction(() => {
+          const comment = events.withTransaction(database, () => {
             const created = database.createComment(taskId, {
               ...input,
               actor: actorFromRequest(request),
@@ -3131,7 +3158,7 @@ export function createTaskboardServer(options = {}) {
           const note = body.note === undefined || body.note === null || body.note === ""
             ? null
             : stringField(body.note, "note", { required: true, maxLength: 4000 });
-          const task = database.transaction(() => {
+          const task = events.withTransaction(database, () => {
             const reviewed = database.reviewTask(id, version, decision, note, actorFromRequest(request));
             events.emit("task.reviewed", { task: reviewed, review: reviewed.latestReview });
             // 授权闭环：审批结果回传指派 agent，让它据此判断下一步（驳回→修改重提）。

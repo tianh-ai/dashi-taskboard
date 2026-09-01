@@ -15,7 +15,8 @@ set -euo pipefail
 REMOTE="${DASHI_DEPLOY_HOST:-tencent}"
 PORT=47823
 SERVICE=dashi-taskboard
-RELEASE_ROOT=/opt/dashi-taskboard-releases
+RELEASE_ROOT=/opt/dashi-taskboard/releases
+CURRENT_LINK=/opt/dashi-taskboard/current
 DATA_DIR=/var/lib/dashi-taskboard/data
 
 log() { printf '[deploy] %s\n' "$*"; }
@@ -51,7 +52,7 @@ ssh "$REMOTE" "mkdir -p '$RELEASE_DIR'"
 git archive HEAD | ssh "$REMOTE" "tar -x -C '$RELEASE_DIR'"
 ssh "$REMOTE" "
   set -e
-  current=\$(readlink -f $RELEASE_ROOT/current)
+  current=\$(readlink -f $CURRENT_LINK)
   # 依赖与前端产物随发布目录拷贝（node_modules 不入 git archive）
   cp -R \"\$current/dist\" '$RELEASE_DIR/dist'
   cp -R \"\$current/node_modules\" '$RELEASE_DIR/node_modules'
@@ -68,7 +69,7 @@ if [ -n "$LEASED" ]; then
   die "服务停止后 $PORT 仍被占用：$LEASED —— 存在抢端口者（隧道/代理），中止并回滚启动旧服务"
 fi
 log "端口干净，切换 symlink 并重启"
-ssh "$REMOTE" "ln -sfn '$RELEASE_DIR' $RELEASE_ROOT/current && systemctl start $SERVICE"
+ssh "$REMOTE" "ln -sfn '$RELEASE_DIR' $CURRENT_LINK && systemctl start $SERVICE"
 
 # ---------- Gate 3：部署后多源验证 ----------
 log "Gate 3：多源验证（端口属主 + 进程 + md5 + /health）"
@@ -86,7 +87,7 @@ VERIFY=$(ssh "$REMOTE" "
   echo \"RESTARTS: \$restarts\"
   [ \"\$restarts\" -lt 3 ] || exit 12
   # 3c. 运行代码 md5 对齐本发布
-  md5_remote=\$(md5sum $RELEASE_ROOT/current/server/app.mjs | cut -d' ' -f1)
+  md5_remote=\$(md5sum $CURRENT_LINK/server/app.mjs | cut -d' ' -f1)
   echo \"REMOTE_MD5: \$md5_remote\"
   # 3d. 健康检查
   health=\$(curl -sf "http://127.0.0.1:$PORT/health" || echo FAILED)

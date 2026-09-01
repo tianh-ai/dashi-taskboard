@@ -73,11 +73,15 @@ ssh "$REMOTE" "ln -sfn '$RELEASE_DIR' $CURRENT_LINK && systemctl start $SERVICE"
 
 # ---------- Gate 3：部署后多源验证 ----------
 log "Gate 3：多源验证（端口属主 + 进程 + md5 + /health）"
-sleep 2
 VERIFY=$(ssh "$REMOTE" "
   set -o pipefail
-  # 3a. 端口属主必须是本机 node 进程
-  owner=\$(ss -ltnp | grep ':$PORT ' || true)
+  # 3a. 轮询等待端口就绪（最多 15s），属主必须是本机 node 进程
+  owner=''
+  for i in \$(seq 1 15); do
+    owner=\$(ss -ltnp | grep ':$PORT ' || true)
+    echo \"\$owner\" | grep -q 'node' && break
+    sleep 1
+  done
   echo \"PORT_OWNER: \$owner\"
   echo \"\$owner\" | grep -q 'node' || exit 10
   # 3b. 服务 active 且无重启循环

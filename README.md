@@ -174,11 +174,28 @@ To use a different UI origin, set `window.__CODEX_TASKBOARD_URL__` before the us
 | `CODEX_TASKBOARD_SERVICE_SECRET_KEYCHAIN_ACCOUNT` | `CODEX_TASKBOARD_SERVICE_SECRET_<AgentId>` | Optional Keychain account containing the WorkBuddy bridge/remote taskctl service secret |
 | `CODEX_TASKBOARD_WECOM_PUBLIC_URL` | empty | Exact HTTPS application URL used for OAuth callbacks |
 | `CODEX_TASKBOARD_WECOM_ALLOWED_USER_IDS` | empty | Optional comma-separated WeCom UserIds allowed to complete OAuth |
-| `CODEX_TASKBOARD_SERVICE_SECRET` | empty | Shared secret used by local Taskboard companions over HTTPS Basic authentication |
+| `CODEX_TASKBOARD_SERVICE_SECRET` | empty | Legacy shared service secret; keep only during migration |
+| `CODEX_TASKBOARD_AGENT_CREDENTIALS` | `[]` | JSON array binding each Agent secret to one `agentId`, device, project allowlist, and capability list |
+| `CODEX_TASKBOARD_COMPANION_SECRET` | empty | Dedicated secret for the local/cloud companion acting-user channel |
+| `CODEX_TASKBOARD_BRIDGE_SECRET` | empty | Dedicated secret for the WorkBuddy bridge; never reuse an Agent or companion secret |
 | `CODEX_TASKBOARD_DEVICE_SOURCES` | `[]` | JSON list of local or SSH Codex project inventories |
 | `CODEX_TASKBOARD_DEVICE_SYNC_INTERVAL_MS` | `300000` | Device inventory refresh interval in milliseconds |
 
 `npm start` prints both the local URL and the available LAN URLs. Teammates on the same trusted network can open one of those LAN URLs and use the same taskboard service. Task, comment, and attachment changes are broadcast to every open client through server-sent events; reconnecting clients perform a full refresh so changes made while disconnected are not missed. A teammate using `taskctl` can point it at the shared service with `CODEX_TASKBOARD_URL=http://<host-ip>:47823`.
+
+Production workers should use bound credentials instead of the legacy shared service secret. An empty `projects` array grants no project access. Keep the JSON and its secrets in the host's protected environment file or secret manager, never in this repository:
+
+```json
+[
+  {
+    "agentId": "codex-mini",
+    "secret": "<unique-secret-from-secret-manager>",
+    "device": "Mini",
+    "projects": ["dashi-taskboard"],
+    "capabilities": ["taskboard", "ops"]
+  }
+]
+```
 
 LAN mode has no account authentication: anyone on the trusted local network who can reach the URL can read and write the taskboard. Public internet and cloud deployment require an authenticated deployment boundary.
 

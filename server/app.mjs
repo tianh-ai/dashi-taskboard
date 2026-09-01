@@ -621,11 +621,15 @@ function assertWorkBuddyBridge(request) {
 
 function canAccessProject(request, database, projectId) {
   const actor = actorFromRequest(request);
-  // Agents are trusted workers: they may read and work on any project, the
-  // same reach dashi_claim_task already grants over MCP. Governance mutations
-  // (done status, review, member/admin management) stay gated to humans via
-  // assertProjectAdmin/assertAdmin, which never accept agent actors.
-  if (actor.type === "agent") return true;
+  if (actor.type === "agent") {
+    if (isWorkBuddyBridge(request)) return true;
+    // 绑定式凭据的空 projects 表示不授权任何项目；不再将空集合解释为全局通行证。
+    if (actor.agentBinding) return actor.agentBinding.projects.includes(projectId);
+    // 旧共享密钥仅作兼容过渡，范围依旧注册表。
+    const username = agentUsernameFromActor(actor);
+    const projects = username ? database.getAgent(username)?.projects : null;
+    return !projects || projects.length === 0 || projects.includes(projectId);
+  }
   if (actor.type === "user" && request.taskboardRole === "admin") return true;
   return actor.type === "user" && Boolean(database.getProjectMembership(projectId, actor.id));
 }
@@ -636,11 +640,15 @@ function assertProjectAccess(request, database, projectId) {
   }
 }
 
-// 每个 Agent 只能读取/领取其注册 projects 范围内的任务；
-// projects 为空表示服务所有项目（常驻 Worker 默认）。
-// 与 dashi_agent_events 的事件过滤保持同一语义。
-function assertAgentProjectScope(database, username, projectId) {
+function assertAgentProjectScope(database, actor, projectId) {
+  const username = agentUsernameFromActor(actor);
   if (!username || username === "workbuddy-agent") return;
+  if (actor.agentBinding) {
+    if (!actor.agentBinding.projects.includes(projectId)) {
+      throw new ApiError(403, "PROJECT_ACCESS_DENIED", "此项目不在该 Agent 的服务端授权范围内");
+    }
+    return;
+  }
   const agent = database.getAgent(username);
   if (agent?.projects?.length > 0 && !agent.projects.includes(projectId)) {
     throw new ApiError(403, "PROJECT_ACCESS_DENIED", "此任务不在该 Agent 的授权项目范围内");
@@ -1940,6 +1948,7 @@ export function createTaskboardServer(options = {}) {
           const args = message.params?.arguments ?? {};
           let result;
           if (toolName === "dashi_project_changes") {
+            assertWorkBuddyBridge(request);
             const after = Number(args.after ?? 0);
             const limit = Number(args.limit ?? 100);
             if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
@@ -1951,22 +1960,25 @@ export function createTaskboardServer(options = {}) {
             const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
             const task = database.getTask(taskId);
             if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
-            assertAgentProjectScope(database, agentUsernameFromActor(actorFromRequest(request)), task.projectId);
+            assertAgentProjectScope(database, actorFromRequest(request), task.projectId);
             result = { task };
           } else if (toolName === "dashi_add_comment") {
             const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
             const body = stringField(args.body, "body", { required: true, maxLength: 100_000 });
+            const task = database.getTask(taskId);
+            if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+            assertAgentProjectScope(database, actorFromRequest(request), task.projectId);
             const comment = database.createComment(taskId, {
               body,
               actor: resolveAgentAuthor(database, actorFromRequest(request)),
             });
-            const task = database.getTask(taskId);
             events.emit("comment.created", { comment, task });
             dispatchCommentMentions(database, events, task, comment);
             result = { comment, task };
           } else if (toolName === "dashi_list_project_messages") {
             const projectId = stringField(args.projectId, "projectId", { required: true, maxLength: 64 });
             validateProjectId(projectId);
+            assertAgentProjectScope(database, actorFromRequest(request), projectId);
             const after = Number(args.after ?? 0);
             const limit = Number(args.limit ?? 100);
             if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
@@ -1977,6 +1989,7 @@ export function createTaskboardServer(options = {}) {
           } else if (toolName === "dashi_post_project_message") {
             const projectId = stringField(args.projectId, "projectId", { required: true, maxLength: 64 });
             validateProjectId(projectId);
+            assertAgentProjectScope(database, actorFromRequest(request), projectId);
             const input = parseProjectMessage({
               body: args.body,
               kind: args.kind,
@@ -2016,6 +2029,9 @@ export function createTaskboardServer(options = {}) {
             if (!username || username === "workbuddy-agent") {
               throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Only the Agent holding the active lease may submit for review");
             }
+            const reviewTarget = database.getTask(taskId);
+            if (!reviewTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+            assertAgentProjectScope(database, actorFromRequest(request), reviewTarget.projectId);
             const task = database.submitClaimedTaskForReview(taskId, username, parseVersion(args.version));
             events.emit("task.moved", { task });
             result = { task };
@@ -2118,6 +2134,24 @@ export function createTaskboardServer(options = {}) {
                 stringField(item, `projects[${index}]`, { required: true, maxLength: 64 }),
               ))
               : [];
+            const binding = actor?.agentBinding;
+            if (binding) {
+              if (args.device !== undefined && String(args.device).trim() !== binding.device) {
+                throw new ApiError(403, "AGENT_SCOPE_MISMATCH", "Agent device is controlled by the server credential binding");
+              }
+              if (args.projects !== undefined && (
+                projects.length !== binding.projects.length
+                || projects.some((projectId) => !binding.projects.includes(projectId))
+              )) {
+                throw new ApiError(403, "AGENT_SCOPE_MISMATCH", "Agent projects are controlled by the server credential binding");
+              }
+              if (args.capabilities !== undefined && (
+                capabilities.length !== binding.capabilities.length
+                || capabilities.some((capability) => !binding.capabilities.includes(capability))
+              )) {
+                throw new ApiError(403, "AGENT_SCOPE_MISMATCH", "Agent capabilities are controlled by the server credential binding");
+              }
+            }
             const concurrency = Number(args.concurrency ?? 1);
             if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 16) {
               throw new ApiError(400, "INVALID_FIELD", "'concurrency' must be an integer between 1 and 16");
@@ -2125,9 +2159,9 @@ export function createTaskboardServer(options = {}) {
             const agent = database.upsertAgent({
               id: explicitId ?? username,
               name: stringField(args.name, "name", { required: true, maxLength: 120 }),
-              device: stringField(args.device ?? "", "device", { required: false, maxLength: 120 }) ?? "",
-              capabilities,
-              projects,
+              device: binding?.device ?? (stringField(args.device ?? "", "device", { required: false, maxLength: 120 }) ?? ""),
+              capabilities: binding?.capabilities ?? capabilities,
+              projects: binding?.projects ?? projects,
               concurrency,
             });
             events.emit("agent.registered", { agent });
@@ -2148,6 +2182,8 @@ export function createTaskboardServer(options = {}) {
             }
             const username = agentUsernameFromActor(actorFromRequest(request));
             const registeredAgent = username ? database.getAgent(username) : null;
+            const eventProjects = actorFromRequest(request)?.agentBinding?.projects
+              ?? registeredAgent?.projects;
             // 未注册 agent 不得静默返回空列表并推进游标：那会永久吞掉派发。
             // 明确 404 让 worker 触发重注册自愈。
             if (username && username !== "workbuddy-agent" && !registeredAgent) {
@@ -2157,8 +2193,8 @@ export function createTaskboardServer(options = {}) {
             const eventsForAgent = username && username !== "workbuddy-agent"
               ? allEvents.filter((event) => (
                 (
-                  registeredAgent?.projects?.length === 0
-                  || registeredAgent?.projects?.includes(event.projectId)
+                  (!actorFromRequest(request)?.agentBinding && eventProjects?.length === 0)
+                  || eventProjects?.includes(event.projectId)
                 )
                 && (
                   event.eventType !== "agent.dispatch"
@@ -2188,7 +2224,7 @@ export function createTaskboardServer(options = {}) {
             const leaseSeconds = boundedLeaseSeconds(args.leaseSeconds);
             const claimTarget = database.getTask(taskId);
             if (!claimTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
-            assertAgentProjectScope(database, username, claimTarget.projectId);
+            assertAgentProjectScope(database, actorFromRequest(request), claimTarget.projectId);
             const claim = database.claimTask(taskId, username, leaseSeconds);
             const agent = database.getAgent(username);
             const agentLabel = agent.device ? `${agent.name}·${agent.device}` : agent.name;
@@ -2217,6 +2253,9 @@ export function createTaskboardServer(options = {}) {
             if (!username) throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Agent tools require agent authentication");
             const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
             const leaseSeconds = boundedLeaseSeconds(args.leaseSeconds);
+            const renewTarget = database.getTask(taskId);
+            if (!renewTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+            assertAgentProjectScope(database, actorFromRequest(request), renewTarget.projectId);
             const lease = database.renewTaskLease(taskId, username, leaseSeconds);
             events.emit("task.lease.renewed", { taskId, lease });
             result = { lease };
@@ -2225,6 +2264,9 @@ export function createTaskboardServer(options = {}) {
             if (!username) throw new ApiError(403, "AGENT_AUTH_REQUIRED", "Agent tools require agent authentication");
             const taskId = stringField(args.taskId, "taskId", { required: true, maxLength: 128 });
             const reason = stringField(args.reason ?? "", "reason", { required: false, maxLength: 500 }) ?? "";
+            const releaseTarget = database.getTask(taskId);
+            if (!releaseTarget) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+            assertAgentProjectScope(database, actorFromRequest(request), releaseTarget.projectId);
             const task = database.releaseTask(taskId, username, { returnToStatus: "todo" });
             const agent = database.getAgent(username);
             if (task) {

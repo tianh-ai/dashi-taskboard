@@ -345,19 +345,41 @@ test("worker config resolution enforces credentials and validates the exec contr
   const config = resolveWorkerConfig(base);
   assert.equal(config.baseUrl, "https://workbuddy.example.test/wecom/app/1000003/taskboard");
   assert.equal(config.clientTag, "task-worker");
+  assert.equal(config.requestTimeoutMs, 30_000);
 
   assert.throws(() => resolveWorkerConfig({ ...base, baseUrl: "" }), /baseUrl/);
   assert.throws(() => resolveWorkerConfig({ ...base, exec: "not-json" }), /exec/);
   assert.throws(() => resolveWorkerConfig({ ...base, exec: JSON.stringify("echo hi") }), /exec/);
   assert.throws(() => resolveWorkerConfig({ ...base, leaseSeconds: 0 }), /leaseSeconds/);
+  assert.throws(() => resolveWorkerConfig({ ...base, requestTimeoutMs: 0 }), /requestTimeoutMs/);
 
   const fromEnv = resolveWorkerConfig({}, {
     DASHI_WORKER_URL: base.baseUrl,
     DASHI_WORKER_USERNAME: "worker-mini",
     DASHI_WORKER_SECRET: "k",
     DASHI_WORKER_NAME: "Worker",
+    DASHI_WORKER_REQUEST_TIMEOUT_MS: "1234",
   });
   assert.equal(fromEnv.username, "worker-mini");
+  assert.equal(fromEnv.requestTimeoutMs, 1234);
+});
+
+test("the mcp client aborts a stalled request instead of hanging the resident worker", async () => {
+  const client = createMcpClient({
+    baseUrl: "https://workbuddy.example.test/wecom/app/1000003/taskboard",
+    username: "worker-timeout",
+    secret: "k",
+    clientTag: "task-worker",
+    requestTimeoutMs: 20,
+    fetch: (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+    }),
+  });
+
+  await assert.rejects(
+    client.call("dashi_agent_heartbeat", {}),
+    (error) => error.code === "SERVICE_UNAVAILABLE" && /timed out after 20ms/.test(error.message),
+  );
 });
 
 test("the mcp client surfaces tool errors with their server-side codes", async () => {
@@ -463,4 +485,3 @@ test("a server event-log reset (cursor moving backwards) triggers replay from ze
   assert.ok(logs.some((message) => message.includes("moved backwards")));
   assert.ok(state.cursor > 0 && state.cursor < 999_999, "游标必须回到服务端实际范围");
 });
-

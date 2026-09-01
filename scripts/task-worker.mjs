@@ -17,6 +17,7 @@ export const WORKER_DEFAULTS = {
   leaseSeconds: 900,
   eventLimit: 50,
   execTimeoutMs: 600_000,
+  requestTimeoutMs: 30_000,
 };
 
 // 派发处理中不可恢复的服务端错误码：跳过该事件并推进游标（毒事件不得卡死轮询）。
@@ -69,6 +70,7 @@ export function resolveWorkerConfig(raw, env = process.env) {
     ["device", "DASHI_WORKER_DEVICE"],
     ["exec", "DASHI_WORKER_EXEC"],
     ["statePath", "DASHI_WORKER_STATE"],
+    ["requestTimeoutMs", "DASHI_WORKER_REQUEST_TIMEOUT_MS"],
     ["workspaceMap", "DASHI_WORKER_WORKSPACE_MAP"],
     ["defaultWorkspace", "DASHI_WORKER_DEFAULT_WORKSPACE"],
   ]) {
@@ -89,6 +91,7 @@ export function resolveWorkerConfig(raw, env = process.env) {
     leaseSeconds: Number(source.leaseSeconds ?? WORKER_DEFAULTS.leaseSeconds),
     eventLimit: Number(source.eventLimit ?? WORKER_DEFAULTS.eventLimit),
     execTimeoutMs: Number(source.execTimeoutMs ?? WORKER_DEFAULTS.execTimeoutMs),
+    requestTimeoutMs: Number(source.requestTimeoutMs ?? WORKER_DEFAULTS.requestTimeoutMs),
     statePath: typeof source.statePath === "string" && source.statePath ? source.statePath : null,
     workspaceMap: parseWorkspaceMap(source.workspaceMap),
     defaultWorkspace: typeof source.defaultWorkspace === "string" && source.defaultWorkspace.trim()
@@ -109,7 +112,7 @@ export function resolveWorkerConfig(raw, env = process.env) {
       );
     }
   }
-  for (const field of ["pollIntervalMs", "heartbeatIntervalMs", "leaseSeconds", "eventLimit", "execTimeoutMs"]) {
+  for (const field of ["pollIntervalMs", "heartbeatIntervalMs", "leaseSeconds", "eventLimit", "execTimeoutMs", "requestTimeoutMs"]) {
     if (!Number.isFinite(config[field]) || config[field] <= 0) {
       throw new WorkerError(`Worker config '${field}' must be a positive number`, "INVALID_CONFIG");
     }
@@ -117,10 +120,18 @@ export function resolveWorkerConfig(raw, env = process.env) {
   return config;
 }
 
-export function createMcpClient({ baseUrl, username, secret, clientTag, fetch: fetchImpl = globalThis.fetch }) {
+export function createMcpClient({
+  baseUrl,
+  username,
+  secret,
+  clientTag,
+  requestTimeoutMs = WORKER_DEFAULTS.requestTimeoutMs,
+  fetch: fetchImpl = globalThis.fetch,
+}) {
   const authorization = `Basic ${Buffer.from(`${username}:${secret}`).toString("base64")}`;
   async function call(toolName, args = {}) {
     let response;
+    const signal = AbortSignal.timeout(requestTimeoutMs);
     try {
       // 相对路径拼接，保留 baseUrl 的路径前缀（公网入口带 /wecom/app/... 前缀）。
       response = await fetchImpl(new URL("mcp/workbuddy", `${baseUrl.replace(/\/+$/, "")}/`), {
@@ -131,11 +142,15 @@ export function createMcpClient({ baseUrl, username, secret, clientTag, fetch: f
           authorization,
           "x-taskboard-client": clientTag,
         },
+        signal,
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: toolName, arguments: args } }),
       });
     } catch (error) {
+      const detail = signal.aborted
+        ? `request timed out after ${requestTimeoutMs}ms`
+        : error instanceof Error ? error.message : String(error);
       throw new WorkerError(
-        `Cannot reach taskboard at ${baseUrl}: ${error instanceof Error ? error.message : String(error)}`,
+        `Cannot reach taskboard at ${baseUrl}: ${detail}`,
         "SERVICE_UNAVAILABLE",
       );
     }

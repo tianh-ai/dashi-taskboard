@@ -21,9 +21,9 @@ Taskboard 内的“项目群聊”是可控的保底会话层：所有项目成�
 - URL：`https://workbuddy.lnhsjs.com/wecom/app/1000003/taskboard/mcp/workbuddy`
 - 传输：Streamable HTTP / HTTP JSON-RPC
 - 请求头：
-  - `Authorization: Basic <base64(username:CODEX_TASKBOARD_SERVICE_SECRET)>`
+  - `Authorization: Basic <base64(workbuddy-agent:CODEX_TASKBOARD_BRIDGE_SECRET)>`
   - `X-Taskboard-Client: workbuddy-bridge`
-- 密钥只放在 WorkBuddy 企业凭据管理和服务端密钥存储中，不写入项目资产、提示词或仓库。
+- Bridge 必须使用独立密钥域；不得复用 Worker Agent 凭据或 companion 凭据。密钥只放在 WorkBuddy 企业凭据管理和服务端密钥存储中，不写入项目资产、提示词或仓库。
 
 服务提供四个工具：
 

@@ -19,6 +19,78 @@ function commaSeparated(value) {
     .filter(Boolean);
 }
 
+const AGENT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$/;
+const PROJECT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+
+function parseAgentCredentials(value) {
+  if (value === undefined || value === null || value === "") return [];
+  let entries = value;
+  if (typeof value === "string") {
+    try {
+      entries = JSON.parse(value);
+    } catch {
+      throw new Error("CODEX_TASKBOARD_AGENT_CREDENTIALS must be valid JSON");
+    }
+  }
+  if (!Array.isArray(entries)) {
+    throw new Error("CODEX_TASKBOARD_AGENT_CREDENTIALS must be a JSON array");
+  }
+  const agentIds = new Set();
+  const secrets = new Set();
+  return entries.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`CODEX_TASKBOARD_AGENT_CREDENTIALS[${index}] must be an object`);
+    }
+    const allowed = new Set(["agentId", "secret", "device", "projects", "capabilities"]);
+    for (const key of Object.keys(entry)) {
+      if (!allowed.has(key)) {
+        throw new Error(`CODEX_TASKBOARD_AGENT_CREDENTIALS[${index}] has unknown field '${key}'`);
+      }
+    }
+    const agentId = String(entry.agentId ?? "").trim();
+    const secret = String(entry.secret ?? "");
+    const device = String(entry.device ?? "").trim();
+    if (!AGENT_ID_PATTERN.test(agentId)) {
+      throw new Error(`CODEX_TASKBOARD_AGENT_CREDENTIALS[${index}].agentId is invalid`);
+    }
+    if (!secret || secret.length > 4096) {
+      throw new Error(`CODEX_TASKBOARD_AGENT_CREDENTIALS[${index}].secret is invalid`);
+    }
+    if (device.length > 120) {
+      throw new Error(`CODEX_TASKBOARD_AGENT_CREDENTIALS[${index}].device is too long`);
+    }
+    if (agentIds.has(agentId)) {
+      throw new Error(`CODEX_TASKBOARD_AGENT_CREDENTIALS contains duplicate agentId '${agentId}'`);
+    }
+    if (secrets.has(secret)) {
+      throw new Error("CODEX_TASKBOARD_AGENT_CREDENTIALS contains duplicate secrets");
+    }
+    agentIds.add(agentId);
+    secrets.add(secret);
+    const parseList = (field, pattern, maxLength) => {
+      const input = entry[field] ?? [];
+      if (!Array.isArray(input)) {
+        throw new Error(`CODEX_TASKBOARD_AGENT_CREDENTIALS[${index}].${field} must be an array`);
+      }
+      const values = input.map((item) => String(item).trim());
+      if (values.some((item) => !item || item.length > maxLength || (pattern && !pattern.test(item)))) {
+        throw new Error(`CODEX_TASKBOARD_AGENT_CREDENTIALS[${index}].${field} contains an invalid value`);
+      }
+      if (new Set(values).size !== values.length) {
+        throw new Error(`CODEX_TASKBOARD_AGENT_CREDENTIALS[${index}].${field} contains duplicates`);
+      }
+      return values;
+    };
+    return Object.freeze({
+      agentId,
+      secret,
+      device,
+      projects: Object.freeze(parseList("projects", PROJECT_ID_PATTERN, 64)),
+      capabilities: Object.freeze(parseList("capabilities", null, 40)),
+    });
+  });
+}
+
 function equalSecret(left, right) {
   const leftHash = createHash("sha256").update(left).digest();
   const rightHash = createHash("sha256").update(right).digest();
@@ -146,6 +218,26 @@ export function resolveWeComConfig(overrides = {}) {
       throw new Error(`CODEX_TASKBOARD_WECOM_PUBLIC_URL must be an HTTPS URL ending in '${basePath}'`);
     }
   }
+  const serviceSecret = String(
+    overrides.serviceSecret ?? environment.CODEX_TASKBOARD_SERVICE_SECRET ?? "",
+  );
+  const serviceExtraSecrets = commaSeparated(
+    overrides.serviceExtraSecrets ?? environment.CODEX_TASKBOARD_SERVICE_EXTRA_SECRETS,
+  ).filter((value) => value.length > 0);
+  const agentCredentials = parseAgentCredentials(
+    overrides.agentCredentials ?? environment.CODEX_TASKBOARD_AGENT_CREDENTIALS,
+  );
+  const privilegedSecrets = [
+    serviceSecret,
+    ...serviceExtraSecrets,
+    String(overrides.companionSecret ?? environment.CODEX_TASKBOARD_COMPANION_SECRET ?? ""),
+    String(overrides.bridgeSecret ?? environment.CODEX_TASKBOARD_BRIDGE_SECRET ?? ""),
+  ].filter(Boolean);
+  for (const credential of agentCredentials) {
+    if (privilegedSecrets.some((secret) => equalSecret(secret, credential.secret))) {
+      throw new Error(`Agent credential '${credential.agentId}' must not reuse another credential domain`);
+    }
+  }
   return {
     enabled: isEnabled,
     corpId: String(overrides.corpId ?? environment.CODEX_TASKBOARD_WECOM_CORP_ID ?? "").trim(),
@@ -157,13 +249,11 @@ export function resolveWeComConfig(overrides = {}) {
     adminUserIds: commaSeparated(
       overrides.adminUserIds ?? environment.CODEX_TASKBOARD_ADMIN_USER_IDS,
     ),
-    serviceSecret: String(
-      overrides.serviceSecret ?? environment.CODEX_TASKBOARD_SERVICE_SECRET ?? "",
-    ),
+    serviceSecret,
     // 每台执行设备一把可独立撤销的服务密钥（同一密钥域，互不可冒充人类/桥）。
-    serviceExtraSecrets: commaSeparated(
-      overrides.serviceExtraSecrets ?? environment.CODEX_TASKBOARD_SERVICE_EXTRA_SECRETS,
-    ).filter((value) => value.length > 0),
+    serviceExtraSecrets,
+    // 绑定式凭据：身份、设备、项目与能力由服务端配置，客户端不得自报。
+    agentCredentials,
     // 专用密钥域：代发用户身份（cloud-companion）与 bridge 冒名绝不能复用
     // 所有 Agent 共享的 serviceSecret，否则任一 Agent 可伪造人类管理员。
     companionSecret: String(
@@ -214,7 +304,13 @@ export function createWeComAuth({ database, config, fetch: fetchImplementation =
   }
 
   function actorFromBasic(request) {
-    if (!config.serviceSecret) return null;
+    if (
+      !config.serviceSecret
+      && config.serviceExtraSecrets.length === 0
+      && config.agentCredentials.length === 0
+      && !config.companionSecret
+      && !config.bridgeSecret
+    ) return null;
     const authorization = request.headers.authorization;
     if (typeof authorization !== "string" || !authorization.startsWith("Basic ")) return null;
     let decoded;
@@ -226,15 +322,35 @@ export function createWeComAuth({ database, config, fetch: fetchImplementation =
     const separator = decoded.indexOf(":");
     if (separator < 1) return null;
     const secret = decoded.slice(separator + 1);
+    const username = decoded.slice(0, separator).trim();
+    if (!username || username.length > 120) return null;
+    const agentBinding = config.agentCredentials.find((credential) => (
+      equalSecret(secret, credential.secret)
+    ));
+    // 绑定密钥只能以配置中的唯一 agentId 使用，阻断持密钥者自报他人身份。
+    if (agentBinding && username !== agentBinding.agentId) return null;
     const matchesService = equalSecret(secret, config.serviceSecret)
       || config.serviceExtraSecrets.some((extra) => equalSecret(secret, extra));
     // 特权密钥域：companion 代发与 bridge 冒名各自校验专用密钥。
     const matchesCompanion = Boolean(config.companionSecret) && equalSecret(secret, config.companionSecret);
     const matchesBridge = Boolean(config.bridgeSecret) && equalSecret(secret, config.bridgeSecret);
-    if (!matchesService && !matchesCompanion && !matchesBridge) return null;
-    const username = decoded.slice(0, separator).trim();
-    if (!username || username.length > 120) return null;
+    if (!agentBinding && !matchesService && !matchesCompanion && !matchesBridge) return null;
     const userId = `basic:${encodeURIComponent(username.toLowerCase())}`;
+    if (agentBinding) {
+      const clientTag = typeof request.headers["x-taskboard-client"] === "string"
+        && request.headers["x-taskboard-client"].length > 0
+        && request.headers["x-taskboard-client"].length <= 64
+        ? request.headers["x-taskboard-client"]
+        : "bound-agent";
+      return {
+        type: "agent",
+        id: `${userId}:${clientTag}`,
+        username: agentBinding.agentId,
+        name: `Agent (${agentBinding.agentId})`,
+        avatarUrl: null,
+        agentBinding,
+      };
+    }
     if (request.headers["x-taskboard-client"] === "cloud-companion") {
       // acting-user 身份转发只信任专用 companion 密钥；共享 serviceSecret 的
       // 普通 Agent 即使带上这些头也只会得到普通 agent 身份，无法成为管理员。

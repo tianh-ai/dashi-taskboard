@@ -268,6 +268,100 @@ test("额外设备密钥可用且可独立撤销，但不授予任何特权身�
   assert.equal(survivor.agent.id, "claude-macbook");
 });
 
+test("绑定式 Agent 凭据锁定身份、设备、能力和项目范围", async () => {
+  const baseUrl = await startServer({
+    agentCredentials: [{
+      agentId: "codex-mini",
+      secret: "bound-mini-secret",
+      device: "Mini",
+      projects: ["scope-a"],
+      capabilities: ["taskboard"],
+    }],
+  });
+  await rest(baseUrl, "/api/projects", { method: "POST", body: { id: "scope-a", name: "授权项目" } });
+  await rest(baseUrl, "/api/projects", { method: "POST", body: { id: "scope-b", name: "未授权项目" } });
+
+  await assert.rejects(
+    mcp(baseUrl, "claude-macbook", "bound-mini-secret", "task-worker", "dashi_agent_register", {
+      name: "伪造 Agent",
+    }),
+    (error) => error.code === "AGENT_AUTH_REQUIRED" || error.code === "UNAUTHORIZED",
+    "绑定密钥不得使用其他 agentId",
+  );
+  await assert.rejects(
+    mcp(baseUrl, "codex-mini", "bound-mini-secret", "task-worker", "dashi_agent_register", {
+      name: "Codex", projects: ["scope-a", "scope-b"],
+    }),
+    (error) => error.code === "AGENT_SCOPE_MISMATCH",
+    "Agent 不得在注册时扩大服务端授权",
+  );
+  const registered = await mcp(
+    baseUrl,
+    "codex-mini",
+    "bound-mini-secret",
+    "task-worker",
+    "dashi_agent_register",
+    { name: "Codex" },
+  );
+  assert.equal(registered.agent.device, "Mini");
+  assert.deepEqual(registered.agent.projects, ["scope-a"]);
+  assert.deepEqual(registered.agent.capabilities, ["taskboard"]);
+
+  const forbiddenTask = await rest(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { projectId: "scope-b", title: "越权任务", status: "todo" },
+  });
+  for (const [tool, args] of [
+    ["dashi_get_task", { taskId: forbiddenTask.body.task.id }],
+    ["dashi_add_comment", { taskId: forbiddenTask.body.task.id, body: "越权评论" }],
+    ["dashi_list_project_messages", { projectId: "scope-b" }],
+    ["dashi_post_project_message", { projectId: "scope-b", body: "越权群聊" }],
+    ["dashi_claim_task", { taskId: forbiddenTask.body.task.id, leaseSeconds: 600 }],
+    ["dashi_renew_task_lease", { taskId: forbiddenTask.body.task.id, leaseSeconds: 600 }],
+    ["dashi_release_task", { taskId: forbiddenTask.body.task.id }],
+    ["dashi_submit_for_review", { taskId: forbiddenTask.body.task.id, version: forbiddenTask.body.task.version }],
+  ]) {
+    await assert.rejects(
+      mcp(baseUrl, "codex-mini", "bound-mini-secret", "task-worker", tool, args),
+      (error) => error.code === "PROJECT_ACCESS_DENIED",
+      `${tool} 必须执行服务端项目范围`,
+    );
+  }
+
+  const restAttempt = await rest(baseUrl, `/api/tasks/${forbiddenTask.body.task.id}`, {
+    headers: {
+      authorization: basic("codex-mini", "bound-mini-secret"),
+      "x-taskboard-client": "task-worker",
+    },
+  });
+  assert.equal(restAttempt.status, 403, "REST 读取也必须执行同一项目范围");
+});
+
+test("绑定式 Agent 凭据配置拒绝重复身份、重复密钥和跨密钥域复用", async () => {
+  assert.throws(() => createTaskboardServer({
+    wecom: {
+      agentCredentials: [
+        { agentId: "same", secret: "a", projects: [] },
+        { agentId: "same", secret: "b", projects: [] },
+      ],
+    },
+  }), /duplicate agentId/);
+  assert.throws(() => createTaskboardServer({
+    wecom: {
+      agentCredentials: [
+        { agentId: "agent-a", secret: "same-secret", projects: [] },
+        { agentId: "agent-b", secret: "same-secret", projects: [] },
+      ],
+    },
+  }), /duplicate secrets/);
+  assert.throws(() => createTaskboardServer({
+    wecom: {
+      serviceSecret: "same-secret",
+      agentCredentials: [{ agentId: "agent-a", secret: "same-secret", projects: [] }],
+    },
+  }), /must not reuse another credential domain/);
+});
+
 test("同步通道不能把已审批完成的任务打回 todo/in_progress", async () => {
   const baseUrl = await startServer();
   await rest(baseUrl, "/api/projects", { method: "POST", body: { id: "done-guard", name: "完成守护" } });

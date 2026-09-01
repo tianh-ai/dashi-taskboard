@@ -30,6 +30,7 @@
     "cloud:deploy:dry-run": "npm run build:web && wrangler deploy --dry-run",
     "cloud:deploy": "npm run build:web && wrangler deploy",
     "cloud:data": "node scripts/migrate-to-cloud.mjs",
+    "audit:claude:database": "bash scripts/claude-audit-database-plan.sh",
     "check": "npm run typecheck && npm run build && npm test"
   },
   "dependencies": {

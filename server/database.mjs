@@ -782,6 +782,43 @@ export class TaskboardDatabase {
     this.database.close();
   }
 
+  getDataHealthSnapshot() {
+    const integrityRows = this.database.prepare("PRAGMA integrity_check").all();
+    const integrityResults = integrityRows.map((row) => String(row.integrity_check));
+    const foreignKeyViolations = this.database.prepare("PRAGMA foreign_key_check").all();
+    const attachments = this.database.prepare("SELECT id, size FROM attachments ORDER BY id").all();
+    const outbox = this.database.prepare(`
+      SELECT destination, COUNT(*) AS event_count, MAX(sequence) AS max_sequence
+      FROM integration_outbox
+      GROUP BY destination
+      ORDER BY destination
+    `).all();
+    const activeLeases = this.database.prepare(
+      "SELECT COUNT(*) AS count FROM task_leases WHERE expires_at > ?",
+    ).get(now()).count;
+    const activeAiRuns = this.database.prepare(
+      "SELECT COUNT(*) AS count FROM ai_chat_runs WHERE status = 'running'",
+    ).get().count;
+    const tableCount = this.database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    `).get().count;
+    return {
+      integrityResults,
+      foreignKeyViolations,
+      attachments,
+      outbox: outbox.map((row) => ({
+        destination: row.destination,
+        eventCount: Number(row.event_count),
+        maxSequence: Number(row.max_sequence),
+      })),
+      activeLeases: Number(activeLeases),
+      activeAiRuns: Number(activeAiRuns),
+      tableCount: Number(tableCount),
+    };
+  }
+
   createWeComOAuthState(state, agentId, expiresAt) {
     const timestamp = now();
     this.database.prepare("DELETE FROM wecom_oauth_states WHERE expires_at <= ?").run(timestamp);

@@ -86,6 +86,87 @@ function sendEmpty(response, status, headers = {}) {
   response.end();
 }
 
+async function dataHealthReport(database, attachmentsDirectory) {
+  const snapshot = database.getDataHealthSnapshot();
+  let missingFiles = 0;
+  let sizeMismatches = 0;
+  for (const attachment of snapshot.attachments) {
+    try {
+      const file = await stat(path.join(attachmentsDirectory, attachment.id));
+      if (file.size !== attachment.size) sizeMismatches += 1;
+    } catch (error) {
+      if (error.code === "ENOENT") missingFiles += 1;
+      else throw error;
+    }
+  }
+  const integrityOk = snapshot.integrityResults.length === 1
+    && snapshot.integrityResults[0] === "ok";
+  const foreignKeysOk = snapshot.foreignKeyViolations.length === 0;
+  const attachmentsOk = missingFiles === 0 && sizeMismatches === 0;
+  const validityLevel = integrityOk && foreignKeysOk && attachmentsOk ? 3 : 1;
+  const ratings = {
+    validity: {
+      code: `V${validityLevel}`,
+      level: validityLevel,
+      evidence: "SQLite integrity, foreign keys, and attachment bytes were checked live",
+    },
+    reliability: {
+      code: "R2",
+      level: 2,
+      limitation: "single-node SQLite; verified restore receipt is external to this process",
+    },
+    synchronization: {
+      code: "S2",
+      level: 2,
+      limitation: "durable outbox exists, but consumer acknowledgements are not stored centrally",
+    },
+    environmentFit: {
+      code: "F2",
+      level: 2,
+      limitation: "Tencent, WorkBuddy, NAS backup, and multi-device paths lack one current combined acceptance receipt",
+    },
+  };
+  return {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    ratingStandard: {
+      scale: "0-4",
+      productionThreshold: 3,
+      rule: "every axis must meet the threshold; levels are never averaged",
+      axes: {
+        V: "data validity",
+        R: "reliability and recovery",
+        S: "synchronization assurance",
+        F: "environment fit",
+      },
+    },
+    database: { engine: "sqlite", tableCount: snapshot.tableCount },
+    checks: {
+      integrity: {
+        ok: integrityOk,
+        result: snapshot.integrityResults.join(", "),
+      },
+      foreignKeys: {
+        ok: foreignKeysOk,
+        violations: snapshot.foreignKeyViolations.length,
+      },
+      attachments: {
+        ok: attachmentsOk,
+        metadataRows: snapshot.attachments.length,
+        missingFiles,
+        sizeMismatches,
+      },
+      outbox: { destinations: snapshot.outbox },
+      activeWork: {
+        leases: snapshot.activeLeases,
+        aiRuns: snapshot.activeAiRuns,
+      },
+    },
+    ratings,
+    productionReady: Object.values(ratings).every((rating) => rating.level >= 3),
+  };
+}
+
 function workBuddyToolResult(value, isError = false) {
   return {
     content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) }],
@@ -1740,6 +1821,17 @@ export function createTaskboardServer(options = {}) {
           role: request.taskboardRole,
           user: actor,
         });
+      }
+
+      if (pathname === "/api/system/data-health") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET data health");
+        assertAdmin(request);
+        return sendJson(
+          response,
+          200,
+          await dataHealthReport(database, resolved.attachmentsDirectory),
+        );
       }
 
       if (pathname === "/api/integrations/workbuddy/changes") {

@@ -27,9 +27,13 @@ if run_audit >"$temporary_path" <<'CLAUDE_AUDIT_PROMPT'
 /Volumes/ssd/tianmac-home/Documents/技能管理及日常管理/dashi-taskboard
 
 必须先自行核验，不能直接相信以下现状说明：
-- 分支 codex/wecom-taskboard；线上腾讯云 release 当前应为 /opt/dashi-taskboard/releases/2026-08-30-perm-matrix。
+- 分支 codex/wecom-taskboard；以实际 HEAD、远端 current symlink 和前后端 SHA-256 为准，不得沿用旧 release 名。
 - 腾讯云 Dashi 主库应为 /var/lib/dashi-taskboard/data/taskboard.sqlite；单写、WAL、每日备份并同步 NAS。
-- Mini 与 MacBook 各有一个常驻 Worker；真实 dashi-taskboard 项目目前可能未配置 workspaceMap，验收项目成功不代表生产项目可执行。
+- 2026-09-04 从中央 API 观察到 codex-mini 与 claude-macbook 都在线且服务端绑定 dashi-taskboard；仍须分别核对本机 workspaceMap 与真实执行证据。
+- 2026-09-04 腾讯云 Tailscale SSH 100.127.231.30:22 多次 5 秒超时；公网 WorkBuddy API 仍可访问。要分开记录 SSH 运维面与业务面健康。
+- 主要业务写入已改为与 integration_outbox 同 SQLite 事务，且 SSE 在 commit 后发布；必须重新做故障注入，不得因为有提交就判定已修复。
+- 已增加管理员专用 /api/system/data-health，预期现阶段为 V3/R2/S2/F2 且 productionReady=false；需验证线上而非只验证源码。
+- Cloudflare D1/R2 是一条独立的精简协作实现，当前 schema 不包含项目群聊、成员、Agent、租约、审批和 outbox 等腾讯云完整模型；不得将 D1 测试通过当成本目标的替代验收。
 - Tencent PostgreSQL 是既有企业微信等结构化业务域的重要事实库，但不是所有领域共用一套表。
 - Mini 的 /Volumes/ssd/Obsidian/toubiao/vault-content.sqlite 是 OB 内容控制库，Mini 单写，Markdown 是投影；当前 pilot 审计可能未通过，不能进入 Dashi 核心可用链路。
 - NAS 负责大文件和备份，不应成为在线事务数据库。
@@ -46,6 +50,7 @@ if run_audit >"$temporary_path" <<'CLAUDE_AUDIT_PROMPT'
 - scripts/sync-backups-to-nas.sh
 - docs/workbuddy-integration.md
 - deploy/tencent/*
+- deploy/tencent/deploy.sh
 - docs/postgresql-one-shot-cutover.md
 - /Volumes/ssd/Obsidian/toubiao/Codex/数据库优先同步设计.md
 - /Volumes/ssd/Obsidian/toubiao/Codex/数据流治理规则.md
@@ -55,14 +60,15 @@ if run_audit >"$temporary_path" <<'CLAUDE_AUDIT_PROMPT'
 重点反驳并核验以下风险：
 1. serviceExtraSecrets 是否真的与 device/agent 绑定，还是任意有效密钥仍可换用户名冒充另一个 Agent。
 2. Agent 项目范围是否覆盖 get、claim、comment、project chat、renew、release、submit 等全部读写入口。
-3. 业务变更与 integration_outbox 是否同事务；宕机窗口会不会出现数据已提交但事件永久丢失。
+3. 全部业务变更与 integration_outbox 是否真的同事务，commit 失败、嵌套回滚和附件文件操作是否仍有半提交窗口。
 4. Worker pending 是否有 nextAttemptAt、退避、最大重试、死信和告警；双 Worker 是否每 10 秒争抢造成噪声。
 5. workspaceMap 是否覆盖真实生产项目；验收项目成功是否被错误外推为系统完成。
 6. SQLite schema migration 是否有明确版本和失败回滚；PRAGMA user_version=0 是否影响可审计升级。
 7. 备份是否存在可执行 restore 脚本、不可变恢复证据、RPO/RTO 记录和 NAS 同步回执。
-8. /health 是否只是进程存活，是否缺少数据库、备份、同步滞后、Worker、outbox 健康指标。
+8. /health 仍只是进程存活；/api/system/data-health 的完整性、外键、附件、outbox 与 V/R/S/F 证据是否真实，是否仍缺备份回执、消费者 ack/滞后与 Worker 健康。
 9. vault-content pilot 当前不健康时，Dashi 是否仍可独立工作，知识发布是否严格异步。
 10. 用户已经决定数据库切换必须一次完成。审计一次性 PostgreSQL 切换方案是否覆盖全部 21 张业务表、序列、附件元数据、身份、聊天、租约、outbox、备份、回滚点和真实跨端验收；禁止长期双写或两个权威源。
+11. deploy/tencent/deploy.sh 是否确实发布当前 HEAD 的前后端产物、校验端口属主与重启稳定性，并在 Gate 3 失败时真正切回上一 release。
 
 采用四轴评级，且不得求平均：
 - V0-V4 数据有效性：未知 / 结构有效 / 语义有效 / 跨源对账 / 业务实证。

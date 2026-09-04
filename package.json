@@ -22,6 +22,7 @@
     "build:web": "vite build --config web/vite.config.ts",
     "typecheck": "tsc -p web/tsconfig.json --noEmit",
     "start": "node server/index.mjs",
+    "data:restore": "node scripts/restore-local-data.mjs",
     "taskctl": "node cli/taskctl.mjs",
     "test": "node --test",
     "test:cloud": "node --test test/cloud-shared-worker.test.mjs",

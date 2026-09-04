@@ -9176,6 +9176,15 @@ kbd {
     margin-left: 0;
   }
 
+  .task-review-actions > div {
+    gap: 8px;
+  }
+
+  .task-review-actions button {
+    flex: 1 1 0;
+    min-height: 44px;
+  }
+
   .composer-footer > span,
   .composer-footer kbd {
     display: none;

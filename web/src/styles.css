@@ -7179,7 +7179,16 @@ kbd {
   border-radius: 999px;
   border: 1px solid var(--border-color, #e5e7eb);
   background: var(--bg-primary, #fff);
+  color: var(--text-primary, #111827);
+  cursor: pointer;
+  font-family: inherit;
   font-size: 12px;
+}
+
+.project-chat-agent:hover,
+.project-chat-agent:focus-visible {
+  border-color: color-mix(in srgb, var(--accent, #5e6ad2) 55%, var(--border-color, #e5e7eb));
+  background: color-mix(in srgb, var(--accent, #5e6ad2) 7%, var(--bg-primary, #fff));
 }
 
 .project-chat-agent i {

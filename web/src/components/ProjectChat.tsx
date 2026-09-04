@@ -47,6 +47,7 @@ export function ProjectChat({ project, currentUser, tasks, onOpenTask }: Project
   const [error, setError] = useState("");
   const cursorRef = useRef(0);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const taskById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks]);
   const pendingMentions = useMemo(() => mentionedAgents(draft, agents), [draft, agents]);
 
@@ -116,6 +117,22 @@ export function ProjectChat({ project, currentUser, tasks, onOpenTask }: Project
     }
   }
 
+  function mentionAgent(agent: AgentStatus) {
+    const composer = composerRef.current;
+    const start = composer?.selectionStart ?? draft.length;
+    const end = composer?.selectionEnd ?? start;
+    const before = draft.slice(0, start);
+    const displayName = agent.device ? `${agent.name}·${agent.device}` : agent.id;
+    const insertion = `${before && !/\s$/.test(before) ? " " : ""}@${displayName} `;
+    const nextDraft = `${before}${insertion}${draft.slice(end)}`;
+    const nextCursor = before.length + insertion.length;
+    setDraft(nextDraft);
+    window.requestAnimationFrame(() => {
+      composer?.focus();
+      composer?.setSelectionRange(nextCursor, nextCursor);
+    });
+  }
+
   return (
     <section className="project-chat" aria-label={`${project.name} 项目群聊`}>
       <header className="project-chat-header">
@@ -129,11 +146,18 @@ export function ProjectChat({ project, currentUser, tasks, onOpenTask }: Project
       <div className="project-chat-agents" aria-label="Agent 在线状态">
         {agents.length === 0 && <small>暂无已注册 Agent</small>}
         {agents.map((agent) => (
-          <span key={agent.id} className={`project-chat-agent${agent.online ? " is-online" : ""}`}>
+          <button
+            key={agent.id}
+            className={`project-chat-agent${agent.online ? " is-online" : ""}`}
+            type="button"
+            aria-label={`在消息中提及 ${agent.device ? `${agent.name}·${agent.device}` : agent.name}`}
+            title="点击加入 @提及"
+            onClick={() => mentionAgent(agent)}
+          >
             <i aria-hidden="true" />
             {agent.device ? `${agent.name}·${agent.device}` : agent.name}
             <small>{agent.online ? `在线 · ${agent.activeLeases.length}/${agent.concurrency} 任务` : "离线"}</small>
-          </span>
+          </button>
         ))}
       </div>
 
@@ -185,6 +209,7 @@ export function ProjectChat({ project, currentUser, tasks, onOpenTask }: Project
 
       <footer className="project-chat-composer">
         <textarea
+          ref={composerRef}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {

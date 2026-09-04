@@ -1635,10 +1635,15 @@ export class TaskboardDatabase {
     return this.findAgentsByMention(name)[0] ?? null;
   }
 
-  findAgentsByMention(name) {
+  findAgentsByMention(name, projectId = null) {
     const lowered = String(name ?? "").trim().toLowerCase();
     if (!lowered) return [];
-    const rows = this.database.prepare("SELECT * FROM agents").all();
+    const rows = this.database.prepare("SELECT * FROM agents").all()
+      .filter((candidate) => {
+        if (!projectId) return true;
+        const projects = JSON.parse(candidate.projects);
+        return projects.length === 0 || projects.includes(projectId);
+      });
     const exactId = rows.find((candidate) => candidate.id.toLowerCase() === lowered);
     if (exactId) return [this.agentFromRow(exactId)];
     const exactDisplay = rows.find((candidate) => (
@@ -1654,6 +1659,12 @@ export class TaskboardDatabase {
     return this.database.prepare("SELECT * FROM agents ORDER BY created_at")
       .all()
       .map((row) => this.agentFromRow(row));
+  }
+
+  listProjectAgents(projectId) {
+    return this.listAgents().filter((agent) => (
+      agent.projects.length === 0 || agent.projects.includes(projectId)
+    ));
   }
 
   getTaskLease(taskId) {

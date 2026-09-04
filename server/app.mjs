@@ -823,7 +823,7 @@ function dispatchAgentMentions(database, events, projectId, message) {
       anyAgent = true;
       continue;
     }
-    const mentionedAgents = database.findAgentsByMention(mention);
+    const mentionedAgents = database.findAgentsByMention(mention, projectId);
     for (const agent of mentionedAgents) {
       if (!targets.some((target) => target.id === agent.id)) {
         targets.push({ id: agent.id, name: agent.name, device: agent.device });
@@ -2450,6 +2450,21 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         assertNoQuery(url.searchParams, "GET /api/agents");
         return sendJson(response, 200, { agents: database.listAgents() });
+      }
+
+      const projectAgentsRoute = pathname.match(/^\/api\/projects\/([^/]+)\/agents$/);
+      if (projectAgentsRoute) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET project agents");
+        let projectId;
+        try {
+          projectId = decodeURIComponent(projectAgentsRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        assertProjectAccess(request, database, projectId);
+        return sendJson(response, 200, { agents: database.listProjectAgents(projectId) });
       }
 
       if (pathname === "/api/devices") {

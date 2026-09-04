@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createProjectMessage, listAgents, listProjectMessages } from "../api";
+import { createProjectMessage, listProjectAgents, listProjectMessages } from "../api";
 import type { ActorIdentity, AgentStatus, Project, ProjectMessage, Task } from "../types";
 
 interface ProjectChatProps {
@@ -86,13 +86,13 @@ export function ProjectChat({ project, currentUser, tasks, onOpenTask }: Project
   }, [messages.length]);
 
   useEffect(() => {
-    const load = (signal?: AbortSignal) => listAgents(signal)
+    const load = (signal?: AbortSignal) => listProjectAgents(project.id, signal)
       .then(setAgents)
       .catch(() => {});
     void load();
     const timer = window.setInterval(() => void load(), 10_000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [project.id]);
 
   async function sendMessage() {
     const body = draft.trim();

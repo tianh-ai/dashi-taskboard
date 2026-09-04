@@ -192,6 +192,14 @@ export async function listAgents(signal?: AbortSignal): Promise<AgentStatus[]> {
   return data.agents;
 }
 
+export async function listProjectAgents(projectId: string, signal?: AbortSignal): Promise<AgentStatus[]> {
+  const data = await request<{ agents: AgentStatus[] }>(
+    `/api/projects/${encodeURIComponent(projectId)}/agents`,
+    { signal },
+  );
+  return data.agents;
+}
+
 export async function refreshDevices(): Promise<Array<{
   deviceId: string;
   status: "online" | "error";

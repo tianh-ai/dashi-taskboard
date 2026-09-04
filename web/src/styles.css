@@ -7114,7 +7114,7 @@ kbd {
 
 .project-chat {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   width: min(920px, calc(100% - 32px));
   height: calc(100% - 24px);
   min-height: 420px;
@@ -7161,9 +7161,10 @@ kbd {
 
 .project-chat-agents {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 8px;
+  overflow-x: auto;
   padding: 10px 22px;
   border-bottom: 1px solid var(--border-color, #e5e7eb);
   background: color-mix(in srgb, var(--bg-secondary, #f9fafb) 65%, transparent);
@@ -7173,6 +7174,7 @@ kbd {
 
 .project-chat-agent {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 6px;
   padding: 3px 10px;
@@ -7342,6 +7344,8 @@ kbd {
   .project-chat { width: calc(100% - 16px); height: calc(100% - 12px); margin-bottom: 8px; }
   .project-chat-header { align-items: flex-start; padding: 14px; }
   .project-chat-header p { max-width: 250px; }
+  .project-chat-agents { padding: 8px 14px; }
+  .project-chat-agent { min-height: 44px; }
   .project-chat-messages { padding: 14px; }
   .project-chat-message { max-width: 92%; }
   .project-chat-composer { padding: 10px; }

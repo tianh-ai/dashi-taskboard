@@ -32,7 +32,8 @@ if run_audit >"$temporary_path" <<'CLAUDE_AUDIT_PROMPT'
 - 2026-09-04 从中央 API 观察到 codex-mini 与 claude-macbook 都在线且服务端绑定 dashi-taskboard；仍须分别核对本机 workspaceMap 与真实执行证据。
 - 2026-09-04 腾讯云 Tailscale SSH 100.127.231.30:22 多次 5 秒超时；公网 WorkBuddy API 仍可访问。要分开记录 SSH 运维面与业务面健康。
 - 主要业务写入已改为与 integration_outbox 同 SQLite 事务，且 SSE 在 commit 后发布；必须重新做故障注入，不得因为有提交就判定已修复。
-- 已增加管理员专用 /api/system/data-health，预期现阶段为 V3/R2/S2/F2 且 productionReady=false；需验证线上而非只验证源码。
+- 已增加管理员专用 /api/system/data-health，预期现阶段为 V3/R1/S2/F2 且 productionReady=false；需验证线上而非只验证源码。
+- 2026-09-04 只读检查 NAS 发现最新完整 backup unit 仍为 taskboard-2026-09-01T19-12-37-343Z.backup；该证据只支持 R1，不支持“每日备份持续正常”或恢复可用。
 - Cloudflare D1/R2 是一条独立的精简协作实现，当前 schema 不包含项目群聊、成员、Agent、租约、审批和 outbox 等腾讯云完整模型；不得将 D1 测试通过当成本目标的替代验收。
 - Tencent PostgreSQL 是既有企业微信等结构化业务域的重要事实库，但不是所有领域共用一套表。
 - Mini 的 /Volumes/ssd/Obsidian/toubiao/vault-content.sqlite 是 OB 内容控制库，Mini 单写，Markdown 是投影；当前 pilot 审计可能未通过，不能进入 Dashi 核心可用链路。

@@ -45,7 +45,7 @@ test("admin data health reports live SQLite integrity and explicit V/R/S/F assur
   assert.equal(health.checks.attachments.missingFiles, 0);
   assert.equal(health.checks.attachments.sizeMismatches, 0);
   assert.equal(health.ratings.validity.code, "V3");
-  assert.equal(health.ratings.reliability.code, "R2");
+  assert.equal(health.ratings.reliability.code, "R1");
   assert.equal(health.ratings.synchronization.code, "S2");
   assert.equal(health.ratings.environmentFit.code, "F2");
   assert.equal(health.ratings.freshness, undefined, "F is environment fit, not freshness");

@@ -111,9 +111,9 @@ async function dataHealthReport(database, attachmentsDirectory) {
       evidence: "SQLite integrity, foreign keys, and attachment bytes were checked live",
     },
     reliability: {
-      code: "R2",
-      level: 2,
-      limitation: "single-node SQLite; verified restore receipt is external to this process",
+      code: "R1",
+      level: 1,
+      limitation: "backups are external to this process; current receipt freshness and restore evidence are unverified",
     },
     synchronization: {
       code: "S2",

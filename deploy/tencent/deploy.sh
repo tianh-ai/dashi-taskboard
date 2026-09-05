@@ -147,4 +147,4 @@ WEB_SHA_REMOTE=$(echo "$VERIFY" | awk '/^WEB_SHA256:/ {print $2}')
 
 SWITCHED=0
 trap - EXIT
-log "部署成功：$RELEASE_NAME（端口属主=node，前后端哈希对齐，健康检查通过）"
+log "部署成功：${RELEASE_NAME}（端口属主=node，前后端哈希对齐，健康检查通过）"

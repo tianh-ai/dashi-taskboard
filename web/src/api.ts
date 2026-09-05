@@ -337,7 +337,10 @@ export async function listDeviceWorkspaces(signal?: AbortSignal): Promise<Record
     const data = await request<{ workspaces: Record<string, string> }>("/api/device-workspaces", { signal });
     return data.workspaces;
   } catch (error) {
-    if (error instanceof ApiError && error.code === "LOCAL_COMPANION_REQUIRED") return {};
+    if (
+      error instanceof ApiError
+      && (error.code === "LOCAL_COMPANION_REQUIRED" || error.code === "LOCAL_ONLY")
+    ) return {};
     throw error;
   }
 }
